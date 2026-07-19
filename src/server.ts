@@ -3,7 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { db, supabase } from './db';
 import { handleTurn } from './orchestrator';
-import { sendWhatsAppMessage, sendConsentButtons, downloadWhatsAppMedia } from './whatsapp';
+import { downloadWhatsAppMedia } from './whatsapp';
+import { getTransport } from './transport';
 import { transcribeAudio } from './transcribe';
 
 dotenv.config();
@@ -76,12 +77,12 @@ app.post('/webhook', async (req: Request, res: Response) => {
         console.log(`[Webhook] Transcribed: "${text}" (confidence: ${transcriptionConfidence})`);
       } catch (err) {
         console.error('[Webhook] Failed to process voice note:', err);
-        await sendWhatsAppMessage(fromPhone, "Sorry, I had trouble processing that voice note. Could you try sending it again, or type a text message?");
+        await getTransport().sendMessage(fromPhone, "Sorry, I had trouble processing that voice note. Could you try sending it again, or type a text message?");
         return res.status(200).send('OK');
       }
     } else {
       // Unrecognized message types (stickers, images, locations)
-      await sendWhatsAppMessage(fromPhone, "Sorry, I can only read text or voice messages right now.");
+      await getTransport().sendMessage(fromPhone, "Sorry, I can only read text or voice messages right now.");
       return res.status(200).send('OK');
     }
 
@@ -124,15 +125,15 @@ app.post('/webhook', async (req: Request, res: Response) => {
         // Start demographics collection — ask for name first
         const firstDemoReply = 'Karibu! Before we begin the interview, could you share your name?';
         await db.appendTurn(sessionId, 'assistant', firstDemoReply, 'text', 'demo_name');
-        await sendWhatsAppMessage(fromPhone, firstDemoReply);
+        await getTransport().sendMessage(fromPhone, firstDemoReply);
       } else if (isConsentNo) {
         console.log(`[Consent] Session ${sessionId} declined.`);
         await db.updateSessionStatus(sessionId, 'declined', false);
-        await sendWhatsAppMessage(fromPhone, "Thank you for your time. The interview has been declined.");
+        await getTransport().sendMessage(fromPhone, "Thank you for your time. The interview has been declined.");
       } else {
         // Did not consent, send the consent buttons
         console.log(`[Consent] Re-prompting consent for session ${sessionId}.`);
-        await sendConsentButtons(fromPhone);
+        await getTransport().sendConsent(fromPhone);
       }
 
       return res.status(200).send('OK');
@@ -142,7 +143,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
     if (text.trim().toLowerCase() === 'stop') {
       console.log(`[Webhook] Stop command received. Terminating session ${sessionId}`);
       await db.updateSessionStatus(sessionId, 'declined');
-      await sendWhatsAppMessage(fromPhone, "You have stopped the interview. Your answers up to this point have been saved. Thank you.");
+      await getTransport().sendMessage(fromPhone, "You have stopped the interview. Your answers up to this point have been saved. Thank you.");
       return res.status(200).send('OK');
     }
 
@@ -153,7 +154,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
     });
 
     // 5. Send orchestrator's response back to respondent
-    await sendWhatsAppMessage(fromPhone, reply);
+    await getTransport().sendMessage(fromPhone, reply);
     return res.status(200).send('OK');
 
   } catch (error) {

@@ -1,5 +1,5 @@
 import { supabase, db } from './db';
-import { sendWhatsAppMessage } from './whatsapp';
+import { getTransport } from './transport';
 
 /**
  * Nudge and Abandonment check job.
@@ -31,8 +31,13 @@ export async function runNudgeJob() {
         const nudgeMessage = "Hey! We still have a couple more questions for you — and honestly, your answers so far have been great. Got a few minutes now, or want us to check back later? You can also just send a voice note if that's easier!";
         
         console.log(`[Nudge Worker] Sending nudge to phone ${phone} for session ${session.id}...`);
-        await sendWhatsAppMessage(phone, nudgeMessage);
-        await db.markNudgeSent(session.id);
+        const result = await getTransport().sendMessage(phone, nudgeMessage);
+        if (result.delivered) {
+          await db.markNudgeSent(session.id);
+          console.log(`[Nudge Worker] Nudge sent successfully for session ${session.id}`);
+        } else {
+          console.error(`[Nudge Worker] Transport failed to deliver nudge for session ${session.id}: ${result.error || 'Unknown error'}`);
+        }
       } catch (err) {
         console.error(`Failed to process 10h nudge for session ${session.id}:`, err);
       }
