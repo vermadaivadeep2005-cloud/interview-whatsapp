@@ -177,22 +177,67 @@ export async function handleTurn(
     }
   }
 
+  // State healing: if consent was given, resolve null/consent to correct state
+  if (session.consent_given) {
+    const DEMO_FIELDS = ['name', 'email', 'age', 'gender', 'county', 'sub_county', 'occupation'] as const;
+    const savedDemo = session.demographics || {};
+    const missingField = DEMO_FIELDS.find((f) => !savedDemo[f]);
+    
+    if (currentQuestionId === 'consent' || !currentQuestionId) {
+      if (missingField) {
+        currentQuestionId = `demo_${missingField}`;
+      } else {
+        // Find the last valid question ID in history that is not demographic
+        const fullHistory = await db.getFullTranscript(sessionId);
+        const lastValidTurn = [...fullHistory].reverse().find((t) => t.role === 'assistant' && t.question_id && !t.question_id.startsWith('demo_'));
+        currentQuestionId = lastValidTurn?.question_id || 'anchor_1';
+      }
+    }
+  }
+
   // 1b. Demographics collection step (runs after consent, before Anchor 1)
   if (session.consent_given && currentQuestionId.startsWith('demo_')) {
     const DEMO_FIELDS = ['name', 'email', 'age', 'gender', 'county', 'sub_county', 'occupation'] as const;
     type DemoField = typeof DEMO_FIELDS[number];
-    const DEMO_PROMPTS: Record<DemoField, string> = {
-      name:       'Karibu! Before we begin the interview, could you share your name?',
-      email:      'What is your email address?',
-      age:        'How old are you?',
-      gender:     'How do you identify your gender?',
-      county:     'Which county are you based in?',
-      sub_county: 'And which sub-county?',
-      occupation: 'What is your current occupation or type of employment?',
-    };
+    
     const currentField = currentQuestionId.replace('demo_', '') as DemoField;
     const savedDemo = ({ ...(session.demographics || {}) }) as Record<string, string>;
-    savedDemo[currentField] = respondentInput.trim();
+    
+    // Save mapped input if option number is provided for dropdown fields
+    let cleanedInput = respondentInput.trim();
+    if (currentField === 'county') {
+      const COUNTIES: Record<string, string> = {
+        '1': 'Nairobi',
+        '2': 'Mombasa',
+        '3': 'Kiambu',
+        '4': 'Nakuru',
+        '5': 'Kisumu',
+        '6': 'Uasin Gishu',
+        '7': 'Other'
+      };
+      if (COUNTIES[cleanedInput]) {
+        cleanedInput = COUNTIES[cleanedInput];
+      }
+    } else if (currentField === 'sub_county') {
+      const isNairobi = savedDemo.county && (savedDemo.county.toLowerCase() === 'nairobi' || savedDemo.county === '1');
+      if (isNairobi) {
+        const NAIROBI_SUB_COUNTIES: Record<string, string> = {
+          '1': 'Westlands',
+          '2': 'Dagoretti',
+          '3': 'Kibra',
+          '4': 'Kasarani',
+          '5': 'Starehe',
+          '6': 'Lang\'ata',
+          '7': 'Embakasi',
+          '8': 'Other'
+        };
+        if (NAIROBI_SUB_COUNTIES[cleanedInput]) {
+          cleanedInput = NAIROBI_SUB_COUNTIES[cleanedInput];
+        }
+      }
+    }
+    
+    savedDemo[currentField] = cleanedInput;
     await db.saveSessionDemographics(sessionId, savedDemo);
     await db.appendTurn(sessionId, 'respondent', respondentInput, meta.inputMode, currentQuestionId);
 
@@ -200,6 +245,18 @@ export async function handleTurn(
     let replyText: string;
     let nextQId: string;
     if (nextField) {
+      const isNairobiSelected = savedDemo.county && (savedDemo.county.toLowerCase() === 'nairobi' || savedDemo.county === '1');
+      const DEMO_PROMPTS: Record<DemoField, string> = {
+        name:       'Karibu! Before we begin the interview, could you share your name?',
+        email:      'What is your email address?',
+        age:        'How old are you?',
+        gender:     'How do you identify your gender?',
+        county:     'Which county are you based in? (Please reply with the number or name):\n1. Nairobi\n2. Mombasa\n3. Kiambu\n4. Nakuru\n5. Kisumu\n6. Uasin Gishu\n7. Other',
+        sub_county: isNairobiSelected
+                      ? 'And which sub-county? (Please reply with the number or name):\n1. Westlands\n2. Dagoretti\n3. Kibra\n4. Kasarani\n5. Starehe\n6. Lang\'ata\n7. Embakasi\n8. Other'
+                      : 'And which sub-county?',
+        occupation: 'What is your current occupation or type of employment?',
+      };
       replyText = DEMO_PROMPTS[nextField];
       nextQId = `demo_${nextField}`;
     } else {
@@ -395,6 +452,7 @@ export async function handleTurn(
   else if (replyText.includes(aq.anchor_4_probe)) nextQuestionId = 'anchor_4_probe';
   else if (replyText.includes(aq.catch_all)) nextQuestionId = 'catch_all';
   else if (replyText.includes(aq.wrap_up)) nextQuestionId = 'wrap_up';
+  else if (replyText.includes('Before we begin the interview, could you share your name?')) nextQuestionId = 'demo_name';
   else if (replyText.includes(aq.close)) {
     nextQuestionId = 'close';
     await db.updateSessionStatus(sessionId, 'completed');
@@ -439,7 +497,7 @@ async function runSimulatedOrchestrator(
                       normalizedInput.includes('okay');
     if (isConsent) {
       await db.updateSessionStatus(sessionId, 'in_progress', true);
-      reply = aq.anchor_1;
+      reply = 'Karibu! Before we begin the interview, could you share your name?';
     } else {
       await db.updateSessionStatus(sessionId, 'declined', false);
       reply = 'Thank you for your time. The interview has been declined.';
