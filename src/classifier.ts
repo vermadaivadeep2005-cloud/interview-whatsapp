@@ -46,10 +46,16 @@ export function classifyLocally(
     };
   }
 
-  const hasPositive = POSITIVE_SIGNALS.test(text);
+  let hasPositive = POSITIVE_SIGNALS.test(text);
   const hasNegative = NEGATIVE_SIGNALS.test(text);
   const hasBarrier  = BARRIER_SIGNALS.test(text);
   const isVague     = VAGUE_SIGNALS.test(text);
+
+  // Strong negations override positive keyword matches (e.g. "nothing has changed")
+  if (/\b(no change|nothing has changed|nothing changed|not changed|no difference|same as before)\b/i.test(text)) {
+    hasPositive = false;
+  }
+
   const isMixed     = hasPositive && (hasNegative || hasBarrier);
 
   // Determine sentiment
@@ -69,12 +75,12 @@ export function classifyLocally(
   let benefit_mechanism: LocalClassification['benefit_mechanism'] = null;
 
   if (questionId === 'anchor_1' || questionId === 'anchor_1_probe') {
-    if (hasPositive && !hasNegative) {
+    if (isMixed) {
+      economic_outcome = 'improved_current_role_only';
+    } else if (hasPositive && !hasNegative) {
       economic_outcome = 'income_increase';
     } else if (!hasPositive && hasNegative) {
       economic_outcome = 'no_change';
-    } else if (isMixed) {
-      economic_outcome = 'improved_current_role_only';
     } else {
       economic_outcome = 'too_early_to_tell';
     }

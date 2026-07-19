@@ -12,6 +12,7 @@
     "cleanup": "tsx src/cleanup.ts",
     "cleanup:confirm": "tsx src/cleanup.ts --confirm",
     "test:smoke": "tsx src/smoke-test.ts",
+    "test": "jest",
     "build": "tsc"
   },
   "dependencies": {
@@ -26,7 +27,11 @@
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/jest": "^30.0.0",
     "@types/node": "^20.12.12",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
+    "ts-node": "^10.9.2",
     "tsx": "^4.10.5",
     "typescript": "^5.4.5"
   }
