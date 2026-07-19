@@ -5,6 +5,7 @@ import { db, supabase } from './db';
 import { handleTurn } from './orchestrator';
 import { downloadWhatsAppMedia } from './whatsapp';
 import { getTransport } from './transport';
+import { logger } from './logger';
 import { transcribeAudio } from './transcribe';
 
 dotenv.config();
@@ -23,11 +24,11 @@ app.get('/webhook', (req: Request, res: Response) => {
   const challenge = req.query['hub.challenge'];
 
   if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
-    console.log('[Webhook] Verification successful!');
+    logger.info('Webhook verification successful', { provider: 'whatsapp', callReason: 'verify_handshake' });
     return res.status(200).send(challenge);
   }
 
-  console.warn('[Webhook] Verification failed. Tokens do not match.');
+  logger.warn('Webhook verification failed: verify token mismatch', { provider: 'whatsapp', callReason: 'verify_handshake' });
   return res.status(403).send('Forbidden');
 });
 
@@ -49,7 +50,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
     }
 
     const fromPhone = message.from;
-    console.log(`[Webhook] Received message from ${fromPhone}, type: ${message.type}`);
+    logger.info('Incoming webhook message received', { provider: 'whatsapp', callReason: 'incoming_webhook', messageType: message.type });
 
     // Retrieve or create session for the phone number
     const session = await db.getOrCreateSessionForPhone(fromPhone);
@@ -67,16 +68,16 @@ app.post('/webhook', async (req: Request, res: Response) => {
       const replyId = message.interactive?.button_reply?.id;
       text = replyId || '';
     } else if (message.type === 'audio') {
-      console.log(`[Webhook] Voice note received with media ID: ${message.audio.id}`);
+      logger.info('Incoming audio voice note received', { provider: 'whatsapp', callReason: 'audio_received' });
       inputMode = 'voice';
       try {
         const media = await downloadWhatsAppMedia(message.audio.id);
         const transcription = await transcribeAudio(media.buffer, media.filename, media.mimeType);
         text = transcription.text;
         transcriptionConfidence = transcription.confidence;
-        console.log(`[Webhook] Transcribed: "${text}" (confidence: ${transcriptionConfidence})`);
+        logger.info('Audio transcription completed', { provider: 'speechmatics', callReason: 'transcription_success' });
       } catch (err) {
-        console.error('[Webhook] Failed to process voice note:', err);
+        logger.error('Failed to process incoming audio voice note', err, { provider: 'whatsapp', success: false });
         await getTransport().sendMessage(fromPhone, "Sorry, I had trouble processing that voice note. Could you try sending it again, or type a text message?");
         return res.status(200).send('OK');
       }
@@ -119,7 +120,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
                           normalizedInput === 'na';
 
       if (isConsentYes) {
-        console.log(`[Consent] Session ${sessionId} consented.`);
+        logger.info('Consent granted for session', { sessionId, callReason: 'consent_granted' });
         await db.updateSessionStatus(sessionId, 'in_progress', true);
 
         // Start demographics collection — ask for name first
@@ -127,12 +128,12 @@ app.post('/webhook', async (req: Request, res: Response) => {
         await db.appendTurn(sessionId, 'assistant', firstDemoReply, 'text', 'demo_name');
         await getTransport().sendMessage(fromPhone, firstDemoReply);
       } else if (isConsentNo) {
-        console.log(`[Consent] Session ${sessionId} declined.`);
+        logger.info('Consent declined for session', { sessionId, callReason: 'consent_declined' });
         await db.updateSessionStatus(sessionId, 'declined', false);
         await getTransport().sendMessage(fromPhone, "Thank you for your time. The interview has been declined.");
       } else {
         // Did not consent, send the consent buttons
-        console.log(`[Consent] Re-prompting consent for session ${sessionId}.`);
+        logger.info('Invalid consent reply: re-prompting buttons', { sessionId, callReason: 'consent_prompt' });
         await getTransport().sendConsent(fromPhone);
       }
 
@@ -141,7 +142,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
 
     // 3. Normal Interview Flow: If user says 'stop', terminate session
     if (text.trim().toLowerCase() === 'stop') {
-      console.log(`[Webhook] Stop command received. Terminating session ${sessionId}`);
+      logger.info('Stop command received: terminating session', { sessionId, callReason: 'user_stopped_session' });
       await db.updateSessionStatus(sessionId, 'declined');
       await getTransport().sendMessage(fromPhone, "You have stopped the interview. Your answers up to this point have been saved. Thank you.");
       return res.status(200).send('OK');
@@ -158,8 +159,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
     return res.status(200).send('OK');
 
   } catch (error) {
-    console.error('[Webhook Error]', error);
-    // Return 200 OK so Meta doesn't flood/retry webhook, but log the crash
+    logger.error('Unhandled webhook route crash', error, { provider: 'whatsapp', success: false });
     return res.status(200).send('OK');
   }
 });

@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { logger } from './logger';
 
 dotenv.config();
 
@@ -54,7 +55,7 @@ export async function transcribeAudio(
   mimeType: string = 'audio/ogg'
 ): Promise<TranscriptionResult> {
   if (!SPEECHMATICS_API_KEY) {
-    console.warn('SPEECHMATICS_API_KEY is not set. Returning mock transcription.');
+    logger.warn('SPEECHMATICS_API_KEY is not set. Returning mock transcription.', { provider: 'speechmatics', callReason: 'missing_api_key' });
     return {
       text: 'This is a simulated transcription of the audio voice note.',
       confidence: 0.9,
@@ -91,7 +92,7 @@ export async function transcribeAudio(
     }
 
     const { id: jobId } = (await submitResponse.json()) as { id: string };
-    console.log(`[Transcribe] Speechmatics job submitted: ${jobId}`);
+    logger.info(`Speechmatics job submitted: ${jobId}`, { provider: 'speechmatics', callReason: 'submit_job' });
 
     // ── Step 2: Poll until the job is done ─────────────────────────────────
     const MAX_POLLS = 30;  // 30 × 2s = 60s max wait
@@ -111,7 +112,7 @@ export async function transcribeAudio(
 
       const statusData = (await statusResponse.json()) as { job: { status: string } };
       const status = statusData.job?.status;
-      console.log(`[Transcribe] Job ${jobId} status: ${status} (poll ${i + 1}/${MAX_POLLS})`);
+      logger.info(`Job ${jobId} status: ${status} (poll ${i + 1}/${MAX_POLLS})`, { provider: 'speechmatics', callReason: 'poll_status' });
 
       if (status === 'done') {
         // ── Step 3: Fetch the transcript ─────────────────────────────────────
@@ -131,7 +132,7 @@ export async function transcribeAudio(
         const text = extractText(transcript);
         const confidence = extractConfidence(transcript);
 
-        console.log(`[Transcribe] Job ${jobId} completed. Text length: ${text.length} chars.`);
+        logger.info(`Speechmatics job ${jobId} completed`, { provider: 'speechmatics', callReason: 'get_transcript', success: true });
         return { text, confidence };
       }
 
@@ -142,7 +143,7 @@ export async function transcribeAudio(
 
     throw new Error(`Speechmatics job ${jobId} did not complete within the timeout window.`);
   } catch (error) {
-    console.error('Error during transcription via Speechmatics:', error);
+    logger.error('Error during transcription via Speechmatics:', error, { provider: 'speechmatics', success: false });
     return {
       text: '[Transcription Failed]',
       confidence: 0.0,

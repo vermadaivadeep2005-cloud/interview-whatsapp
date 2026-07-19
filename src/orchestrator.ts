@@ -3,6 +3,7 @@ import { GoogleGenAI } from '@google/genai';
 import { db, Turn, Protocol } from './db';
 import { classifyLocally } from './classifier';
 import { assertValidTag, TagInput } from './tag-validator';
+import { logger } from './logger';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -224,7 +225,7 @@ export async function handleTurn(
 
   // 3. Run local classifier first — skip Gemini if confidence is high enough
   const localClassification = classifyLocally(respondentInput, currentQuestionId);
-  console.log(`[Classifier] question=${currentQuestionId} confidence=${localClassification.confidence} reason=${localClassification.call_reason}`);
+  logger.info('Local classification completed', { sessionId, questionId: currentQuestionId, provider: 'local_classifier', callReason: localClassification.call_reason, confidence: localClassification.confidence });
 
   // Count how many Gemini calls have been made this session (via saved tags)
   const allTags = await db.getTagsForSession(sessionId);
@@ -251,7 +252,7 @@ export async function handleTurn(
     try {
       assertValidTag(localTag, 'LocalClassifier');
       await db.saveTag(sessionId, { ...localTag, metadata: { gemini_call: false, call_reason: localClassification.call_reason } });
-      console.log(`[Orchestrator] Gemini skipped (local confidence=${localClassification.confidence}). Tag saved locally.`);
+      logger.info('Gemini skipped: local classification confident', { sessionId, questionId: currentQuestionId, provider: 'local_classifier', confidence: localClassification.confidence });
     } catch (e) {
       console.warn('[Orchestrator] Local tag validation failed:', (e as Error).message);
     }
@@ -260,7 +261,7 @@ export async function handleTurn(
   // 4. Check if we should use the Live Gemini API, Claude API, or run in Simulated Mode
   const gemini = ai;
   if (shouldCallGemini && gemini) {
-    console.log(`[Orchestrator] Calling Gemini API (${GEMINI_MODEL}) for session ${sessionId}... [call ${geminiCallCount + 1}/${MAX_GEMINI_CALLS_PER_SESSION}]`);
+    logger.info('Calling Gemini API', { sessionId, questionId: currentQuestionId, provider: 'gemini', callReason: 'low_confidence_fallback', callIndex: geminiCallCount + 1 });
     // Format history for Gemini contents array
     const contents = history.map((turn) => ({
       role: (turn.role as string) === 'respondent' ? 'user' : 'model',
@@ -287,7 +288,7 @@ export async function handleTurn(
         const call = response.functionCalls[0];
         if (call.name === 'log_response') {
           const input = call.args as any;
-          console.log(`[Orchestrator] Save Tag via Gemini:`, input);
+          logger.info('Gemini model triggered log_response tool call', { sessionId, questionId: currentQuestionId, provider: 'gemini', callReason: 'tool_execution' });
           const tagToSave: TagInput = {
             question_id: input.question_id,
             raw_response: input.raw_response,
