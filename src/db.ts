@@ -69,13 +69,14 @@ export interface ResponseTag {
   question_id: string;
   source: 'live' | 'batch_audit';
   raw_response: string;
-  economic_outcome: string | null;
-  bottleneck_types: string[] | null;
-  benefit_mechanism: string | null;
-  sentiment: string | null;
-  confidence_in_tagging: number | null;
-  transcription_confidence: number | null;
-  quotable_snippet: string | null;
+  economic_outcome?: string | null;
+  bottleneck_types?: string[] | null;
+  benefit_mechanism?: string | null;
+  sentiment?: string | null;
+  confidence_in_tagging?: number | null;
+  transcription_confidence?: number | null;
+  quotable_snippet?: string | null;
+  metadata?: any;
 }
 
 // Database helper functions
@@ -281,6 +282,17 @@ export const db = {
       .insert(formattedTags);
 
     if (error) throw error;
+  },
+
+  async getTagsForSession(sessionId: string): Promise<ResponseTag[]> {
+    const { data, error } = await supabase
+      .from('response_tags')
+      .select('*')
+      .eq('session_id', sessionId)
+      .order('id', { ascending: true });
+
+    if (error) throw error;
+    return data || [];
   },
 
   async updateSessionActivity(sessionId: string) {

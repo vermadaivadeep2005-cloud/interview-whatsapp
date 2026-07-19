@@ -1,6 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { GoogleGenAI } from '@google/genai';
 import { db, Turn, Protocol } from './db';
+import { classifyLocally } from './classifier';
+import { assertValidTag, TagInput } from './tag-validator';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -10,8 +12,12 @@ const MODEL_NAME = process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022';
 const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+
+// Gemini call-gating config
+const MIN_CONFIDENCE_FOR_GEMINI = parseFloat(process.env.MIN_CONFIDENCE_FOR_GEMINI || '0.7');
+const MAX_GEMINI_CALLS_PER_SESSION = parseInt(process.env.MAX_GEMINI_CALLS_PER_SESSION || '10', 10);
 
 // Tool definition for log_response
 export const logResponseTool = {
@@ -216,9 +222,45 @@ export async function handleTurn(
 
   let replyText = '';
 
-  // 3. Check if we should use the Live Gemini API, Claude API, or run in Simulated Mode
-  if (ai) {
-    console.log(`[Orchestrator] Calling Gemini API (${GEMINI_MODEL}) for session ${sessionId}...`);
+  // 3. Run local classifier first — skip Gemini if confidence is high enough
+  const localClassification = classifyLocally(respondentInput, currentQuestionId);
+  console.log(`[Classifier] question=${currentQuestionId} confidence=${localClassification.confidence} reason=${localClassification.call_reason}`);
+
+  // Count how many Gemini calls have been made this session (via saved tags)
+  const allTags = await db.getTagsForSession(sessionId);
+  const geminiCallCount = allTags.filter((t: any) => t.metadata?.gemini_call === true).length;
+  const geminiCapReached = geminiCallCount >= MAX_GEMINI_CALLS_PER_SESSION;
+
+  const shouldCallGemini = Boolean(ai) &&
+    localClassification.confidence < MIN_CONFIDENCE_FOR_GEMINI &&
+    !geminiCapReached;
+
+  if (!shouldCallGemini && localClassification.confidence >= MIN_CONFIDENCE_FOR_GEMINI) {
+    const localTag: TagInput = {
+      question_id: currentQuestionId,
+      raw_response: respondentInput,
+      economic_outcome: localClassification.economic_outcome as any,
+      bottleneck_types: localClassification.bottleneck_types as any,
+      benefit_mechanism: localClassification.benefit_mechanism as any,
+      sentiment: localClassification.sentiment,
+      confidence_in_tagging: localClassification.confidence,
+      transcription_confidence: meta.transcriptionConfidence,
+      quotable_snippet: respondentInput.slice(0, 80),
+      turn_id: respondentTurn.id,
+    };
+    try {
+      assertValidTag(localTag, 'LocalClassifier');
+      await db.saveTag(sessionId, { ...localTag, metadata: { gemini_call: false, call_reason: localClassification.call_reason } });
+      console.log(`[Orchestrator] Gemini skipped (local confidence=${localClassification.confidence}). Tag saved locally.`);
+    } catch (e) {
+      console.warn('[Orchestrator] Local tag validation failed:', (e as Error).message);
+    }
+  }
+
+  // 4. Check if we should use the Live Gemini API, Claude API, or run in Simulated Mode
+  const gemini = ai;
+  if (shouldCallGemini && gemini) {
+    console.log(`[Orchestrator] Calling Gemini API (${GEMINI_MODEL}) for session ${sessionId}... [call ${geminiCallCount + 1}/${MAX_GEMINI_CALLS_PER_SESSION}]`);
     // Format history for Gemini contents array
     const contents = history.map((turn) => ({
       role: (turn.role as string) === 'respondent' ? 'user' : 'model',
@@ -231,7 +273,7 @@ export async function handleTurn(
     });
 
     try {
-      let response = await ai.models.generateContent({
+      let response = await gemini.models.generateContent({
         model: GEMINI_MODEL,
         contents: contents as any,
         config: {
@@ -246,7 +288,7 @@ export async function handleTurn(
         if (call.name === 'log_response') {
           const input = call.args as any;
           console.log(`[Orchestrator] Save Tag via Gemini:`, input);
-          await db.saveTag(sessionId, {
+          const tagToSave: TagInput = {
             question_id: input.question_id,
             raw_response: input.raw_response,
             economic_outcome: input.economic_outcome || null,
@@ -257,7 +299,10 @@ export async function handleTurn(
             transcription_confidence: meta.transcriptionConfidence,
             quotable_snippet: input.quotable_snippet || null,
             turn_id: respondentTurn.id,
-          });
+            metadata: { gemini_call: true, model: GEMINI_MODEL }
+          };
+          assertValidTag(tagToSave, 'GeminiAPI');
+          await db.saveTag(sessionId, tagToSave);
 
           // Resume contents to get the actual text reply from Gemini
           contents.push(response.candidates?.[0]?.content as any); // model's functionCall turn
@@ -268,7 +313,7 @@ export async function handleTurn(
             }]
           });
 
-          const resumeResponse = await ai.models.generateContent({
+          const resumeResponse = await gemini.models.generateContent({
             model: GEMINI_MODEL,
             contents: contents as any,
             config: {
