@@ -9,6 +9,8 @@
     "test-cli": "tsx src/test-cli.ts",
     "nudge": "tsx src/nudge-worker.ts",
     "audit-db": "tsx src/db-audit.ts",
+    "cleanup": "tsx src/cleanup.ts",
+    "cleanup:confirm": "tsx src/cleanup.ts --confirm",
     "build": "tsc"
   },
   "dependencies": {
