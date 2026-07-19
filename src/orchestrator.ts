@@ -22,7 +22,7 @@ export const logResponseTool = {
     properties: {
       question_id: {
         type: 'string',
-        enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all'],
+        enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all', 'wrap_up'],
         description: 'The ID of the question currently being answered.',
       },
       raw_response: {
@@ -76,7 +76,7 @@ export const geminiLogResponseTool = {
     properties: {
       question_id: {
         type: 'STRING',
-        enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all'],
+        enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all', 'wrap_up'],
         description: 'The ID of the question currently being answered.',
       },
       raw_response: {
@@ -127,10 +127,20 @@ RULES:
 - Ask ONE question at a time. Never stack questions.
 - Ask the anchor questions in order, verbatim, for every respondent.
 - After each anchor answer, decide whether to probe — only if the answer is vague, under 15 words, or contradicts what the branch expects. Max 1 probe per anchor.
+- If the respondent gives a MIXED answer to Anchor 1 (some change but also barriers), ask brief versions of BOTH Anchor 2 AND Anchor 3 in sequence.
 - Never lead the respondent or suggest an answer.
 - After EVERY respondent turn, call the log_response tool before writing your reply.
 - Keep every message short — this is WhatsApp, not email.
 - End the interview after all required questions are covered, or after 15 minutes of active conversation.
+- After the catch-all question, always ask the wrap-up question before closing.
+
+SWAHILI LOCALISATION — use EXACTLY ONE of these per response at the correct trigger. Never use more than one per message:
+- "Karibu" (Welcome) — only during the very first greeting/onboarding message
+- "Safi sana!" (Very cool!) — only when the respondent shares a strongly positive or highly insightful milestone
+- "Sawa" (Okay/Alright) — as an acknowledgment prefix before transitioning to a new topic
+- "Naam" (Yes/Indeed) — as a politeness marker when validating a tough or complex point
+- "Usijali!" (Don't worry!) — if the respondent apologises, wants to skip, or makes an error
+- "Asante sana" (Thank you very much) — when wrapping up a topic or closing the interview
 
 QUESTIONS:
 ${JSON.stringify(protocol.anchor_questions, null, 2)}
@@ -303,6 +313,7 @@ export async function handleTurn(
   else if (replyText.includes(aq.anchor_4)) nextQuestionId = 'anchor_4';
   else if (replyText.includes(aq.anchor_4_probe)) nextQuestionId = 'anchor_4_probe';
   else if (replyText.includes(aq.catch_all)) nextQuestionId = 'catch_all';
+  else if (replyText.includes(aq.wrap_up)) nextQuestionId = 'wrap_up';
   else if (replyText.includes(aq.close)) {
     nextQuestionId = 'close';
     await db.updateSessionStatus(sessionId, 'completed');
@@ -353,14 +364,18 @@ async function runSimulatedOrchestrator(
       reply = 'Thank you for your time. The interview has been declined.';
     }
   } else if (currentQuestionId === 'anchor_1') {
-    // User answered Anchor 1 (Outcome). Did they report change? Check English/Hindi keywords
+    // User answered Anchor 1 (Outcome)
     const hasChange = input.toLowerCase().match(/(yes|change|promote|raise|job|income|money|hired|improved|got|haan|han|ha|fayda|faida|badla|nokri|kamai)/i);
-    
+    const hasBarrier = input.toLowerCase().match(/(but|however|though|except|although|still|yet|barrier|difficult|hard|struggle|nahi|par|lekin)/i);
+    const isMixed = hasChange && hasBarrier;
+
     // Check if response is vague/under 15 words -> probe
     if (wordCount < 15) {
       reply = aq.anchor_1_probe;
+    } else if (isMixed) {
+      // Mixed: briefly ask Anchor 2 first, then Anchor 3 in the next turn
+      reply = `Naam, I hear you — things shifted in some ways but there are still hurdles. ${aq.anchor_2}`;
     } else {
-      // Branch depending on change
       reply = hasChange ? aq.anchor_3 : aq.anchor_2;
     }
 
@@ -368,10 +383,10 @@ async function runSimulatedOrchestrator(
       question_id: 'anchor_1',
       raw_response: input,
       economic_outcome: hasChange ? 'income_increase' : 'no_change',
-      bottleneck_types: hasChange ? ['bottleneck_none_reported'] : ['bottleneck_opportunity'],
+      bottleneck_types: (hasBarrier || !hasChange) ? ['bottleneck_opportunity'] : ['bottleneck_none_reported'],
       benefit_mechanism: hasChange ? 'new_income_stream' : 'not_applicable',
-      sentiment: hasChange ? 'positive' : 'neutral',
-      confidence_in_tagging: 0.9,
+      sentiment: isMixed ? 'mixed' : (hasChange ? 'positive' : 'neutral'),
+      confidence_in_tagging: isMixed ? 0.75 : 0.9,
       quotable_snippet: words.slice(0, 5).join(' ') + '...',
     };
   } else if (currentQuestionId === 'anchor_1_probe') {
@@ -486,11 +501,26 @@ async function runSimulatedOrchestrator(
       quotable_snippet: input,
     };
   } else if (currentQuestionId === 'catch_all') {
-    // User answered Catch All
-    reply = aq.close;
+    // User answered Catch All -> ask wrap-up before closing
+    reply = aq.wrap_up;
 
     mockTag = {
       question_id: 'catch_all',
+      raw_response: input,
+      economic_outcome: null,
+      bottleneck_types: null,
+      benefit_mechanism: null,
+      sentiment: 'neutral',
+      confidence_in_tagging: 0.8,
+      quotable_snippet: words.slice(0, 5).join(' ') + '...',
+    };
+  } else if (currentQuestionId === 'wrap_up') {
+    // User answered Wrap-Up -> close the interview
+    reply = aq.close;
+    await db.updateSessionStatus(sessionId, 'completed');
+
+    mockTag = {
+      question_id: 'wrap_up',
       raw_response: input,
       economic_outcome: null,
       bottleneck_types: null,

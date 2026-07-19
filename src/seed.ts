@@ -1,7 +1,7 @@
 import { supabase } from './db';
 
 async function seed() {
-  console.log('Seeding protocol version 1.0.0...');
+  console.log('Seeding protocol version 1.1.0...');
 
   // Deactivate any existing protocols
   const { error: deactivateError } = await supabase
@@ -24,7 +24,8 @@ async function seed() {
     anchor_4: "Have you shared anything from the training with colleagues, or changed how your team works as a result? What happened?",
     anchor_4_probe: "What specifically did you share, and how did it land?",
     catch_all: "If AI literacy training could have done ONE more thing to actually move your income or opportunities, what would that have been?",
-    close: "Thanks — that's everything I needed. Your responses will be anonymized and used to shape future training."
+    wrap_up: "Is there anything else you would like to add that we have not yet discussed?",
+    close: "Asante sana — that's everything I needed. Your responses will be anonymized and used to shape future training."
   };
 
   const codebook = {
@@ -43,13 +44,24 @@ async function seed() {
     sentiment: {
       description: "Respondent's general attitude towards the training and their outcome.",
       enum: ['positive', 'neutral', 'negative', 'mixed']
+    },
+    swahili_vocabulary: {
+      description: "Approved Swahili terms for localisation. The AI must use these at the correct trigger points — never more than ONE per response.",
+      terms: {
+        "Karibu":     { meaning: "Welcome",           trigger: "Initial onboarding and greeting phase" },
+        "Safi sana!": { meaning: "Very cool! / Great!", trigger: "Only when respondent shares a strongly positive or highly insightful milestone" },
+        "Sawa":       { meaning: "Okay / Alright",      trigger: "Acknowledgment prefix before transitioning to a new topic" },
+        "Naam":       { meaning: "Yes / Indeed",        trigger: "Politeness marker when validating a tough or complex point" },
+        "Usijali!":   { meaning: "Don't worry!",        trigger: "If respondent apologises for a long message, wants to skip, or makes an error" },
+        "Asante sana":{ meaning: "Thank you very much", trigger: "Wrapping up a topic or closing the interview" }
+      }
     }
   };
 
   const { data, error } = await supabase
     .from('protocols')
     .insert({
-      version: '1.0.0',
+      version: '1.1.0',
       is_active: true,
       anchor_questions: anchorQuestions,
       codebook: codebook
@@ -62,7 +74,7 @@ async function seed() {
     process.exit(1);
   }
 
-  console.log('Successfully seeded protocol version 1.0.0! Protocol ID:', data.id);
+  console.log('Successfully seeded protocol version 1.1.0! Protocol ID:', data.id);
   process.exit(0);
 }
 

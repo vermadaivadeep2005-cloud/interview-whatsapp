@@ -8,6 +8,7 @@
     "seed": "tsx src/seed.ts",
     "test-cli": "tsx src/test-cli.ts",
     "nudge": "tsx src/nudge-worker.ts",
+    "audit-db": "tsx src/db-audit.ts",
     "build": "tsc"
   },
   "dependencies": {

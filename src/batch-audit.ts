@@ -74,7 +74,7 @@ export const geminiBatchTagTool = {
           properties: {
             question_id: {
               type: 'STRING',
-              enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all'],
+              enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all', 'wrap_up'],
             },
             raw_response: { type: 'STRING' },
             economic_outcome: {
