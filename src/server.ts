@@ -85,6 +85,20 @@ app.post('/webhook', async (req: Request, res: Response) => {
       return res.status(200).send('OK');
     }
 
+    // Update session mode_of_input if needed
+    const currentMode = session.mode_of_input;
+    let nextMode = currentMode;
+    if (!currentMode) {
+      nextMode = inputMode;
+    } else if (currentMode === 'text' && inputMode === 'voice') {
+      nextMode = 'mixed';
+    } else if (currentMode === 'voice' && inputMode === 'text') {
+      nextMode = 'mixed';
+    }
+    if (nextMode !== currentMode && nextMode) {
+      await db.updateSessionModeOfInput(sessionId, nextMode);
+    }
+
     // 2. Gatekeeper: Enforce Consent flow before storing turns or triggering orchestrator
     if (!session.consent_given) {
       const normalizedInput = text.trim().toLowerCase();

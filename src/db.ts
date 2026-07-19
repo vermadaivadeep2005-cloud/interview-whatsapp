@@ -49,6 +49,7 @@ export interface Session {
   nudge_sent_at: string | null;
   completed_at: string | null;
   demographics: Record<string, string> | null; // name, email, age, gender, county, sub_county, occupation
+  mode_of_input: 'text' | 'voice' | 'mixed' | null;
   respondent_phone?: string; // virtual field for joins
 }
 
@@ -351,6 +352,15 @@ export const db = {
     const { error } = await supabase
       .from('sessions')
       .update({ demographics })
+      .eq('id', sessionId);
+
+    if (error) throw error;
+  },
+
+  async updateSessionModeOfInput(sessionId: string, newMode: 'text' | 'voice' | 'mixed') {
+    const { error } = await supabase
+      .from('sessions')
+      .update({ mode_of_input: newMode })
       .eq('id', sessionId);
 
     if (error) throw error;
