@@ -48,6 +48,7 @@ export interface Session {
   last_activity_at: string | null;
   nudge_sent_at: string | null;
   completed_at: string | null;
+  demographics: Record<string, string> | null; // name, email, age, gender, county, sub_county, occupation
   respondent_phone?: string; // virtual field for joins
 }
 
@@ -325,6 +326,19 @@ export const db = {
     const { error } = await supabase
       .from('sessions')
       .update({ status: 'abandoned' })
+      .eq('id', sessionId);
+
+    if (error) throw error;
+  },
+
+  /**
+   * Saves collected demographics (name, email, age, gender, county, sub_county, occupation)
+   * to the session's demographics JSONB column.
+   */
+  async saveSessionDemographics(sessionId: string, demographics: Record<string, string>) {
+    const { error } = await supabase
+      .from('sessions')
+      .update({ demographics })
       .eq('id', sessionId);
 
     if (error) throw error;

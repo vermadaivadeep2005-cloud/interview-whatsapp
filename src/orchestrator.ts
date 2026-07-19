@@ -170,6 +170,41 @@ export async function handleTurn(
     }
   }
 
+  // 1b. Demographics collection step (runs after consent, before Anchor 1)
+  if (session.consent_given && currentQuestionId.startsWith('demo_')) {
+    const DEMO_FIELDS = ['name', 'email', 'age', 'gender', 'county', 'sub_county', 'occupation'] as const;
+    type DemoField = typeof DEMO_FIELDS[number];
+    const DEMO_PROMPTS: Record<DemoField, string> = {
+      name:       'Karibu! Before we begin the interview, could you share your name?',
+      email:      'What is your email address?',
+      age:        'How old are you?',
+      gender:     'How do you identify your gender?',
+      county:     'Which county are you based in?',
+      sub_county: 'And which sub-county?',
+      occupation: 'What is your current occupation or type of employment?',
+    };
+    const currentField = currentQuestionId.replace('demo_', '') as DemoField;
+    const savedDemo = ({ ...(session.demographics || {}) }) as Record<string, string>;
+    savedDemo[currentField] = respondentInput.trim();
+    await db.saveSessionDemographics(sessionId, savedDemo);
+    await db.appendTurn(sessionId, 'respondent', respondentInput, meta.inputMode, currentQuestionId);
+
+    const nextField = DEMO_FIELDS.find((f) => !savedDemo[f]);
+    let replyText: string;
+    let nextQId: string;
+    if (nextField) {
+      replyText = DEMO_PROMPTS[nextField];
+      nextQId = `demo_${nextField}`;
+    } else {
+      // All 7 fields collected — move to Anchor 1
+      replyText = `Sawa, thank you! Now let's begin.\n\n${protocol.anchor_questions.anchor_1}`;
+      nextQId = 'anchor_1';
+    }
+    await db.appendTurn(sessionId, 'assistant', replyText, 'text', nextQId);
+    await db.updateSessionActivity(sessionId);
+    return replyText;
+  }
+
   // 2. Append respondent's turn to DB first (consent must be gated at the API level, not here)
   const respondentTurn = await db.appendTurn(
     sessionId,

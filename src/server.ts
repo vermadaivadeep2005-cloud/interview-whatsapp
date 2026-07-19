@@ -105,16 +105,12 @@ app.post('/webhook', async (req: Request, res: Response) => {
 
       if (isConsentYes) {
         console.log(`[Consent] Session ${sessionId} consented.`);
-        // Update session state
         await db.updateSessionStatus(sessionId, 'in_progress', true);
-        
-        // Hand off to orchestrator with a mock "Yes, continue" to trigger the first question (Anchor 1)
-        const reply = await handleTurn(sessionId, "Yes, continue", {
-          inputMode: 'text',
-          transcriptionConfidence: null
-        });
-        
-        await sendWhatsAppMessage(fromPhone, reply);
+
+        // Start demographics collection — ask for name first
+        const firstDemoReply = 'Karibu! Before we begin the interview, could you share your name?';
+        await db.appendTurn(sessionId, 'assistant', firstDemoReply, 'text', 'demo_name');
+        await sendWhatsAppMessage(fromPhone, firstDemoReply);
       } else if (isConsentNo) {
         console.log(`[Consent] Session ${sessionId} declined.`);
         await db.updateSessionStatus(sessionId, 'declined', false);
