@@ -9,6 +9,8 @@ import requests
 # Load environment variables from the parent directory .env file
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:3000")
+
 st.set_page_config(page_title="Interview Dashboard", layout="wide")
 
 @st.cache_resource
@@ -253,7 +255,7 @@ elif page == "Web Interview":
                 if submitted and user_input:
                     with st.spinner("Sending..."):
                         try:
-                            resp = requests.post("http://localhost:3000/api/web-chat", json={"phone": st.session_state.phone, "text": user_input})
+                            resp = requests.post(f"{BACKEND_URL}/api/web-chat", json={"phone": st.session_state.phone, "text": user_input})
                             if resp.status_code == 200:
                                 st.rerun()
                             else:
@@ -269,7 +271,7 @@ elif page == "Web Interview":
                     try:
                         files = {'audio': ('recording.wav', audio_value.getvalue(), 'audio/wav')}
                         data = {'phone': st.session_state.phone}
-                        resp = requests.post("http://localhost:3000/api/web-chat", data=data, files=files)
+                        resp = requests.post(f"{BACKEND_URL}/api/web-chat", data=data, files=files)
                         if resp.status_code == 200:
                             st.rerun()
                         else:
