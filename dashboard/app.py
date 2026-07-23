@@ -255,7 +255,8 @@ elif page == "Web Interview":
                 if submitted and user_input:
                     with st.spinner("Sending..."):
                         try:
-                            resp = requests.post(f"{BACKEND_URL}/api/web-chat", json={"phone": st.session_state.phone, "text": user_input})
+                            headers = {"Bypass-Tunnel-Reminder": "true"}
+                            resp = requests.post(f"{BACKEND_URL}/api/web-chat", json={"phone": st.session_state.phone, "text": user_input}, headers=headers)
                             if resp.status_code == 200:
                                 st.rerun()
                             else:
@@ -271,7 +272,8 @@ elif page == "Web Interview":
                     try:
                         files = {'audio': ('recording.wav', audio_value.getvalue(), 'audio/wav')}
                         data = {'phone': st.session_state.phone}
-                        resp = requests.post(f"{BACKEND_URL}/api/web-chat", data=data, files=files)
+                        headers = {"Bypass-Tunnel-Reminder": "true"}
+                        resp = requests.post(f"{BACKEND_URL}/api/web-chat", data=data, files=files, headers=headers)
                         if resp.status_code == 200:
                             st.rerun()
                         else:
