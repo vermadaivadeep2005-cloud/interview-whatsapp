@@ -1,4 +1,4 @@
-import { db, Turn, Protocol } from './db';
+import { db, Turn, Protocol, Question, validateDemographicField } from './db';
 import { classifyLocally } from './classifier';
 import { assertValidTag, TagInput, sanitizeTagInput } from './tag-validator';
 import { logger } from './logger';
@@ -165,6 +165,43 @@ ${JSON.stringify(protocol.anchor_questions, null, 2)}
 }
 
 /**
+ * Determines the question_type for a given anchor_key or demographic field.
+ */
+function getQuestionType(anchorKeyOrField: string): 'open_ended' | 'mcq' | 'free_text' {
+  // Demographic MCQ fields
+  if (anchorKeyOrField === 'demo_county' || anchorKeyOrField === 'demo_sub_county' || anchorKeyOrField === 'demo_gender') {
+    return 'mcq';
+  }
+  // Demographic free text fields
+  if (anchorKeyOrField.startsWith('demo_')) {
+    return 'free_text';
+  }
+  // Consent is free text (yes/no)
+  if (anchorKeyOrField === 'consent') {
+    return 'free_text';
+  }
+  // All anchor questions and probes are open-ended
+  return 'open_ended';
+}
+
+/**
+ * Determines the options JSONB for MCQ-type questions.
+ */
+function getQuestionOptions(anchorKey: string, demographics?: Record<string, string>): any | null {
+  if (anchorKey === 'demo_county') {
+    return { '1': 'Nairobi', '2': 'Mombasa', '3': 'Kiambu', '4': 'Nakuru', '5': 'Kisumu', '6': 'Uasin Gishu', '7': 'Other' };
+  }
+  if (anchorKey === 'demo_sub_county') {
+    const isNairobi = demographics?.county && (demographics.county.toLowerCase() === 'nairobi' || demographics.county === '1');
+    if (isNairobi) {
+      return { '1': 'Westlands', '2': 'Dagoretti', '3': 'Kibra', '4': 'Kasarani', '5': 'Starehe', '6': "Lang'ata", '7': 'Embakasi', '8': 'Other' };
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
  * Main interview orchestrator turn handler.
  */
 export async function handleTurn(
@@ -176,8 +213,18 @@ export async function handleTurn(
   const protocol = await db.getProtocol(session.protocol_id);
   const history = await db.getHistory(sessionId);
 
+  // Update last_activity_at on every user message
+  await db.updateSessionActivity(sessionId);
+
+  // Compute the turn number for tagging (next turn number after what's already in the DB)
+  const fullTranscriptForCount = await db.getFullTranscript(sessionId);
+  const currentTurnNumber = fullTranscriptForCount.length + 1;
+
   // 1. Determine which question the respondent is answering
   let currentQuestionId: string = 'consent';
+  // Track the question_uuid of the question that prompted this response
+  let pendingQuestionUuid: string | null = null;
+
   if (history.length > 0) {
     // Find the last assistant message and its question_id if stored
     const fullHistory = await db.getFullTranscript(sessionId);
@@ -185,6 +232,23 @@ export async function handleTurn(
     if (lastAssistantTurn && lastAssistantTurn.question_id) {
       currentQuestionId = lastAssistantTurn.question_id;
     }
+  }
+
+  // Try to find the question_uuid from the questions table for the question the user is answering
+  // (the last question inserted for this session should be the one being answered)
+  try {
+    const { data: lastQuestion } = await (await import('./db')).supabase
+      .from('questions')
+      .select('id')
+      .eq('session_id', sessionId)
+      .order('turn_number', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (lastQuestion) {
+      pendingQuestionUuid = lastQuestion.id;
+    }
+  } catch {
+    // Non-critical: if questions table doesn't exist yet, continue without it
   }
 
   // State healing: if consent was given, resolve null/consent to correct state
@@ -246,9 +310,40 @@ export async function handleTurn(
         }
       }
     }
+
+    // §4 Demographics Validation: validate name, email, age before saving
+    const validation = validateDemographicField(currentField, cleanedInput);
+    if (!validation.valid) {
+      // Do NOT save — re-prompt with friendly message, stay on same demo field
+      logger.warn('Demographics validation failed, re-prompting', {
+        sessionId,
+        field: currentField,
+        callReason: 'demographics_validation_failed',
+      });
+      await db.appendTurn(sessionId, 'respondent', respondentInput, meta.inputMode, currentQuestionId);
+      const rePromptText = validation.message!;
+      await db.appendTurn(sessionId, 'assistant', rePromptText, 'text', currentQuestionId);
+      return rePromptText;
+    }
     
     savedDemo[currentField] = cleanedInput;
-    await db.saveSessionDemographics(sessionId, savedDemo);
+
+    // Wrap in try/catch to handle DB CHECK constraint violations gracefully
+    try {
+      await db.saveSessionDemographics(sessionId, savedDemo);
+    } catch (dbError: any) {
+      logger.error('Demographics save failed (constraint violation)', dbError, {
+        sessionId,
+        field: currentField,
+        error: JSON.stringify(dbError),
+      });
+      // Re-prompt user with a friendly message
+      await db.appendTurn(sessionId, 'respondent', respondentInput, meta.inputMode, currentQuestionId);
+      const constraintMsg = `Sorry, there was an issue saving that value. Could you please try entering your ${currentField} again?`;
+      await db.appendTurn(sessionId, 'assistant', constraintMsg, 'text', currentQuestionId);
+      return constraintMsg;
+    }
+
     await db.appendTurn(sessionId, 'respondent', respondentInput, meta.inputMode, currentQuestionId);
 
     const nextField = DEMO_FIELDS.find((f) => !savedDemo[f]);
@@ -274,8 +369,23 @@ export async function handleTurn(
       replyText = `Sawa, thank you! Now let's begin.\n\n${protocol.anchor_questions.anchor_1}`;
       nextQId = 'anchor_1';
     }
-    await db.appendTurn(sessionId, 'assistant', replyText, 'text', nextQId);
-    await db.updateSessionActivity(sessionId);
+
+    // Insert question into questions table
+    const assistantTurn = await db.appendTurn(sessionId, 'assistant', replyText, 'text', nextQId);
+    try {
+      await db.insertQuestion(
+        sessionId,
+        session.protocol_id,
+        nextQId,
+        replyText,
+        getQuestionType(nextQId),
+        assistantTurn.turn_number,
+        getQuestionOptions(nextQId, savedDemo)
+      );
+    } catch (qErr) {
+      logger.error('Failed to insert question record for demographics', qErr, { sessionId, questionId: nextQId });
+    }
+
     return replyText;
   }
 
@@ -315,13 +425,19 @@ export async function handleTurn(
       transcription_confidence: meta.transcriptionConfidence,
       quotable_snippet: respondentInput.slice(0, 80),
       turn_id: respondentTurn.id,
+      question_uuid: pendingQuestionUuid,
+      turn_number: respondentTurn.turn_number,
     };
     try {
       assertValidTag(localTag, 'LocalClassifier');
       await db.saveTag(sessionId, { ...localTag, metadata: { llm_call: false, call_reason: localClassification.call_reason } });
       logger.info('LLM skipped: local classification confident', { sessionId, questionId: currentQuestionId, provider: 'local_classifier', confidence: localClassification.confidence });
     } catch (e) {
-      console.warn('[Orchestrator] Local tag validation failed:', (e as Error).message);
+      logger.error('[Orchestrator] Local tag validation/save failed', e, {
+        sessionId,
+        questionId: currentQuestionId,
+        error: (e as Error).message,
+      });
     }
   }
 
@@ -332,7 +448,7 @@ export async function handleTurn(
     const messages: ChatMessage[] = [
       { role: 'system', content: buildSystemPrompt(protocol) },
       ...history.map((turn) => ({
-        role: (turn.role === 'respondent' ? 'user' : 'assistant') as 'user' | 'assistant',
+        role: turn.role as 'user' | 'assistant',
         content: turn.content,
       })),
       { role: 'user', content: respondentInput }
@@ -372,6 +488,8 @@ export async function handleTurn(
             transcription_confidence: meta.transcriptionConfidence,
             quotable_snippet: input.quotable_snippet || null,
             turn_id: respondentTurn.id,
+            question_uuid: pendingQuestionUuid,
+            turn_number: respondentTurn.turn_number,
             metadata: { llm_call: true, model: LLM_MODEL }
           };
           assertValidTag(tagToSave, 'OpenAIAPI');
@@ -395,6 +513,35 @@ export async function handleTurn(
 
       if (!toolCallExecuted) {
         replyText = assistantMessage?.content || '';
+        // §1 Fix: LLM responded without a tool call — save a fallback tag so the response is not lost
+        logger.warn('LLM did not trigger log_response tool call; saving fallback tag', {
+          sessionId,
+          questionId: currentQuestionId,
+        });
+        const fallbackTag: TagInput = {
+          question_id: currentQuestionId,
+          raw_response: respondentInput,
+          economic_outcome: null,
+          bottleneck_types: null,
+          benefit_mechanism: null,
+          sentiment: 'neutral',
+          confidence_in_tagging: 0.5,
+          transcription_confidence: meta.transcriptionConfidence,
+          quotable_snippet: respondentInput.slice(0, 80),
+          turn_id: respondentTurn.id,
+          question_uuid: pendingQuestionUuid,
+          turn_number: respondentTurn.turn_number,
+          metadata: { llm_call: true, model: LLM_MODEL, fallback: true },
+        };
+        try {
+          await db.saveTag(sessionId, fallbackTag);
+        } catch (e) {
+          logger.error('[Orchestrator] Failed to save fallback tag on LLM no-tool-call path', e, {
+            sessionId,
+            questionId: currentQuestionId,
+            error: (e as Error).message,
+          });
+        }
       }
     } catch (err: any) {
       console.error('--- DETAILED LLM ERROR LOG ---');
@@ -413,8 +560,10 @@ export async function handleTurn(
         respondentInput,
         currentQuestionId,
         respondentTurn.id,
+        respondentTurn.turn_number,
         protocol,
-        meta.transcriptionConfidence
+        meta.transcriptionConfidence,
+        pendingQuestionUuid
       );
       replyText = simResult.reply;
     }
@@ -426,8 +575,10 @@ export async function handleTurn(
       respondentInput,
       currentQuestionId,
       respondentTurn.id,
+      respondentTurn.turn_number,
       protocol,
-      meta.transcriptionConfidence
+      meta.transcriptionConfidence,
+      pendingQuestionUuid
     );
     replyText = simResult.reply;
   }
@@ -453,8 +604,24 @@ export async function handleTurn(
     await db.updateSessionStatus(sessionId, 'completed');
   }
 
-  await db.appendTurn(sessionId, 'assistant', replyText, 'text', nextQuestionId);
-  await db.updateSessionActivity(sessionId);
+  const assistantTurn = await db.appendTurn(sessionId, 'assistant', replyText, 'text', nextQuestionId);
+
+  // Insert question record into questions table for the question the bot is now asking
+  if (nextQuestionId && nextQuestionId !== 'close') {
+    try {
+      await db.insertQuestion(
+        sessionId,
+        session.protocol_id,
+        nextQuestionId,
+        replyText,
+        getQuestionType(nextQuestionId),
+        assistantTurn.turn_number,
+        getQuestionOptions(nextQuestionId)
+      );
+    } catch (qErr) {
+      logger.error('Failed to insert question record', qErr, { sessionId, questionId: nextQuestionId });
+    }
+  }
 
   return replyText;
 }
@@ -468,8 +635,10 @@ async function runSimulatedOrchestrator(
   input: string,
   currentQuestionId: string,
   turnId: string,
+  turnNumber: number,
   protocol: Protocol,
-  transcriptionConfidence: number | null
+  transcriptionConfidence: number | null,
+  pendingQuestionUuid: string | null
 ): Promise<{ reply: string }> {
   const aq = protocol.anchor_questions;
   const words = input.trim().split(/\s+/).filter(Boolean);
@@ -664,17 +833,39 @@ async function runSimulatedOrchestrator(
       quotable_snippet: words.slice(0, 5).join(' ') + '...',
     };
   } else {
-    // Fallback/Close state
+    // §1 Fix: Fallback/Close state — still save the response tag instead of silently dropping it
     reply = aq.close;
+    await db.updateSessionStatus(sessionId, 'completed');
+
+    mockTag = {
+      question_id: currentQuestionId || 'unknown',
+      raw_response: input,
+      economic_outcome: null,
+      bottleneck_types: null,
+      benefit_mechanism: null,
+      sentiment: 'neutral',
+      confidence_in_tagging: 0.5,
+      quotable_snippet: words.slice(0, 5).join(' ') + '...',
+    };
   }
 
-  // Save the mock tag if generated
+  // Save the mock tag — always, on every path
   if (mockTag) {
-    await db.saveTag(sessionId, {
-      ...mockTag,
-      transcription_confidence: transcriptionConfidence,
-      turn_id: turnId,
-    });
+    try {
+      await db.saveTag(sessionId, {
+        ...mockTag,
+        transcription_confidence: transcriptionConfidence,
+        turn_id: turnId,
+        question_uuid: pendingQuestionUuid,
+        turn_number: turnNumber,
+      });
+    } catch (e) {
+      logger.error('[Orchestrator] Failed to save response tag in simulated mode', e, {
+        sessionId,
+        questionId: mockTag.question_id,
+        error: (e as Error).message,
+      });
+    }
   }
 
   return { reply };

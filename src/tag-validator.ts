@@ -42,6 +42,8 @@ export interface TagInput {
   transcription_confidence?: number | null;
   quotable_snippet?: string | null;
   turn_id: string | null;
+  question_uuid?: string | null;
+  turn_number?: number | null;
   metadata?: any;
 }
 

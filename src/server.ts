@@ -50,11 +50,18 @@ app.post('/webhook', async (req: Request, res: Response) => {
     }
 
     const fromPhone = message.from;
+
+    // §5 Channel derivation: messages arriving via the WhatsApp Cloud API webhook are 'whatsapp'
+    const channel = 'whatsapp';
+
     logger.info('Incoming webhook message received', { provider: 'whatsapp', callReason: 'incoming_webhook', messageType: message.type });
 
-    // Retrieve or create session for the phone number
-    const session = await db.getOrCreateSessionForPhone(fromPhone);
+    // Retrieve or create session for the phone number, passing derived channel
+    const session = await db.getOrCreateSessionForPhone(fromPhone, channel);
     const sessionId = session.id;
+
+    // §6 Update last_activity_at on every incoming message, before any processing
+    await db.updateSessionActivity(sessionId);
 
     let text = '';
     let inputMode: 'text' | 'voice' = 'text';
@@ -143,16 +150,34 @@ app.post('/webhook', async (req: Request, res: Response) => {
     // 3. Normal Interview Flow: If user says 'stop', terminate session
     if (text.trim().toLowerCase() === 'stop') {
       logger.info('Stop command received: terminating session', { sessionId, callReason: 'user_stopped_session' });
-      await db.updateSessionStatus(sessionId, 'declined');
+      // §6 Fix: 'stop' mid-interview should be 'abandoned', not 'declined'
+      // 'declined' is for refusing consent; 'abandoned' is for quitting mid-way
+      await db.updateSessionStatus(sessionId, 'abandoned');
       await getTransport().sendMessage(fromPhone, "You have stopped the interview. Your answers up to this point have been saved. Thank you.");
       return res.status(200).send('OK');
     }
 
-    // 4. Send to orchestrator
-    const reply = await handleTurn(sessionId, text, {
-      inputMode,
-      transcriptionConfidence
-    });
+    // 4. Send to orchestrator — wrapped in try/catch to handle errors and update session status
+    let reply: string;
+    try {
+      reply = await handleTurn(sessionId, text, {
+        inputMode,
+        transcriptionConfidence
+      });
+    } catch (orchErr) {
+      // §6: Error boundary — don't leave session stuck at 'in_progress' on unrecoverable errors
+      logger.error('handleTurn threw an unrecoverable error; marking session abandoned', orchErr, {
+        sessionId,
+        callReason: 'orchestrator_crash',
+      });
+      try {
+        await db.updateSessionStatus(sessionId, 'abandoned');
+      } catch (statusErr) {
+        logger.error('Failed to mark session abandoned after orchestrator crash', statusErr, { sessionId });
+      }
+      await getTransport().sendMessage(fromPhone, "Sorry, something went wrong on our end. Your answers have been saved. We'll follow up with you.");
+      return res.status(200).send('OK');
+    }
 
     // 5. Send orchestrator's response back to respondent
     await getTransport().sendMessage(fromPhone, reply);

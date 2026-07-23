@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import { logger } from './logger';
 
 dotenv.config();
 
@@ -63,11 +64,24 @@ export interface Turn {
   input_mode: 'text' | 'voice' | null;
 }
 
+export interface Question {
+  id: string;
+  session_id: string;
+  protocol_id: string;
+  anchor_key: string | null;
+  question_text: string;
+  question_type: 'open_ended' | 'mcq' | 'free_text';
+  options: any | null;
+  turn_number: number;
+  created_at: string;
+}
+
 export interface ResponseTag {
   id: string;
   session_id: string;
   turn_id: string | null;
   question_id: string;
+  question_uuid?: string | null;
   source: 'live' | 'batch_audit';
   raw_response: string;
   economic_outcome?: string | null;
@@ -77,7 +91,58 @@ export interface ResponseTag {
   confidence_in_tagging?: number | null;
   transcription_confidence?: number | null;
   quotable_snippet?: string | null;
+  turn_number?: number | null;
   metadata?: any;
+}
+
+// Demographics validation helpers
+const NAME_REGEX = /^[A-Za-z][A-Za-z .'\-]{1,60}$/;
+const EMAIL_REGEX = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+export interface DemoValidationResult {
+  valid: boolean;
+  invalidField?: string;
+  message?: string;
+}
+
+/**
+ * Validates a single demographics field. Returns { valid: true } or { valid: false, invalidField, message }.
+ */
+export function validateDemographicField(field: string, value: string): DemoValidationResult {
+  const trimmed = value.trim();
+
+  if (field === 'name') {
+    if (!NAME_REGEX.test(trimmed)) {
+      return {
+        valid: false,
+        invalidField: 'name',
+        message: "Hmm, that doesn't look like a valid name. Could you please share your name using only letters, spaces, dots, hyphens, or apostrophes? (2–61 characters)",
+      };
+    }
+  }
+
+  if (field === 'email') {
+    if (!EMAIL_REGEX.test(trimmed)) {
+      return {
+        valid: false,
+        invalidField: 'email',
+        message: "That doesn't seem to be a valid email address. Could you please double-check and send it again? (e.g. name@example.com)",
+      };
+    }
+  }
+
+  if (field === 'age') {
+    const ageNum = parseInt(trimmed, 10);
+    if (isNaN(ageNum) || !Number.isInteger(ageNum) || ageNum < 10 || ageNum > 99 || String(ageNum) !== trimmed) {
+      return {
+        valid: false,
+        invalidField: 'age',
+        message: "Please enter a valid age as a whole number between 10 and 99.",
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 // Database helper functions
@@ -86,7 +151,7 @@ export const db = {
   /**
    * Resolves a phone number to an active session, creating the respondent/session if necessary.
    */
-  async getOrCreateSessionForPhone(phone: string): Promise<Session> {
+  async getOrCreateSessionForPhone(phone: string, channel: string = 'web'): Promise<Session> {
     // 1. Check if respondent exists
     let { data: respondent, error: rError } = await supabase
       .from('respondents')
@@ -140,12 +205,13 @@ export const db = {
     if (sError) throw sError;
 
     if (!session) {
-      // Create a new session
+      // Create a new session with the derived channel
       const { data: newSession, error: insertSError } = await supabase
         .from('sessions')
         .insert({
           respondent_id: respondent.id,
           protocol_id: protocol.id,
+          channel,
           status: 'invited',
           consent_given: false,
           last_activity_at: new Date().toISOString(),
@@ -251,6 +317,43 @@ export const db = {
     return newTurn as Turn;
   },
 
+  /**
+   * Inserts a question record into the questions table.
+   * Returns the generated question row (including its id for use as question_uuid).
+   */
+  async insertQuestion(
+    sessionId: string,
+    protocolId: string,
+    anchorKey: string | null,
+    questionText: string,
+    questionType: 'open_ended' | 'mcq' | 'free_text',
+    turnNumber: number,
+    options: any | null = null
+  ): Promise<Question> {
+    const { data, error } = await supabase
+      .from('questions')
+      .insert({
+        session_id: sessionId,
+        protocol_id: protocolId,
+        anchor_key: anchorKey,
+        question_text: questionText,
+        question_type: questionType,
+        turn_number: turnNumber,
+        options,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Failed to insert question into questions table', error, {
+        sessionId,
+        questionId: anchorKey || undefined,
+      });
+      throw error;
+    }
+    return data as Question;
+  },
+
   async saveTag(sessionId: string, tagData: Omit<ResponseTag, 'id' | 'session_id' | 'source'> & { turn_id: string | null }) {
     const { error } = await supabase
       .from('response_tags')
@@ -260,7 +363,14 @@ export const db = {
         ...tagData,
       });
 
-    if (error) throw error;
+    if (error) {
+      logger.error('Failed to insert response_tag', error, {
+        sessionId,
+        questionId: tagData.question_id,
+        error: JSON.stringify(error),
+      });
+      throw error;
+    }
   },
 
   async saveBatchTags(sessionId: string, tags: Array<any>) {
@@ -276,13 +386,20 @@ export const db = {
       confidence_in_tagging: t.confidence_in_tagging || null,
       transcription_confidence: t.transcription_confidence || null,
       quotable_snippet: t.quotable_snippet || null,
+      turn_number: t.turn_number || null,
     }));
 
     const { error } = await supabase
       .from('response_tags')
       .insert(formattedTags);
 
-    if (error) throw error;
+    if (error) {
+      logger.error('Failed to insert batch response_tags', error, {
+        sessionId,
+        error: JSON.stringify(error),
+      });
+      throw error;
+    }
   },
 
   async getTagsForSession(sessionId: string): Promise<ResponseTag[]> {
@@ -290,7 +407,7 @@ export const db = {
       .from('response_tags')
       .select('*')
       .eq('session_id', sessionId)
-      .order('id', { ascending: true });
+      .order('turn_number', { ascending: true, nullsFirst: false });
 
     if (error) throw error;
     return data || [];
@@ -323,7 +440,13 @@ export const db = {
       .update(updates)
       .eq('id', sessionId);
 
-    if (error) throw error;
+    if (error) {
+      logger.error('Failed to update session status', error, {
+        sessionId,
+        error: JSON.stringify(error),
+      });
+      throw error;
+    }
   },
 
   async markNudgeSent(sessionId: string) {
@@ -347,6 +470,7 @@ export const db = {
   /**
    * Saves collected demographics (name, email, age, gender, county, sub_county, occupation)
    * to the session's demographics JSONB column.
+   * Handles constraint-violation errors gracefully.
    */
   async saveSessionDemographics(sessionId: string, demographics: Record<string, string>) {
     const { error } = await supabase
@@ -354,7 +478,13 @@ export const db = {
       .update({ demographics })
       .eq('id', sessionId);
 
-    if (error) throw error;
+    if (error) {
+      logger.error('Failed to save session demographics (possible CHECK constraint violation)', error, {
+        sessionId,
+        error: JSON.stringify(error),
+      });
+      throw error;
+    }
   },
 
   async updateSessionModeOfInput(sessionId: string, newMode: 'text' | 'voice' | 'mixed') {

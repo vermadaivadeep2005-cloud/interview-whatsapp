@@ -29,13 +29,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     respondent_id uuid REFERENCES respondents(id) NOT NULL,
     protocol_id uuid REFERENCES protocols(id) NOT NULL,
-    channel text NOT NULL DEFAULT 'whatsapp',
+    channel text NOT NULL DEFAULT 'web' CHECK (channel IN ('web', 'whatsapp')),
     status text NOT NULL DEFAULT 'invited' CHECK (status IN ('invited','consented','in_progress','completed','abandoned','declined')),
     consent_given boolean DEFAULT false,
     last_activity_at timestamptz,
     nudge_sent_at timestamptz,
     completed_at timestamptz,
     metadata jsonb DEFAULT '{}'::jsonb
+);
+
+-- 4b. Questions: Stores every question the bot asks, linked to protocol and session
+CREATE TABLE IF NOT EXISTS questions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id uuid REFERENCES sessions(id) NOT NULL,
+    protocol_id uuid REFERENCES protocols(id) NOT NULL,
+    anchor_key text,
+    question_text text NOT NULL,
+    question_type text NOT NULL DEFAULT 'open_ended' CHECK (question_type IN ('open_ended', 'mcq', 'free_text')),
+    options jsonb,
+    turn_number integer NOT NULL,
+    created_at timestamptz DEFAULT now()
 );
 
 -- 5. Turns: Append-only, immutable transcript — never edit a row here after it's written
@@ -57,6 +70,7 @@ CREATE TABLE IF NOT EXISTS response_tags (
     session_id uuid REFERENCES sessions(id) NOT NULL,
     turn_id uuid REFERENCES turns(id),
     question_id text NOT NULL,
+    question_uuid uuid REFERENCES questions(id),
     source text NOT NULL CHECK (source IN ('live','batch_audit')),
     raw_response text NOT NULL,
     economic_outcome text,
@@ -66,6 +80,7 @@ CREATE TABLE IF NOT EXISTS response_tags (
     confidence_in_tagging numeric(3,2),
     transcription_confidence numeric(3,2),
     quotable_snippet text,
+    turn_number integer,
     metadata jsonb DEFAULT '{}'::jsonb
 );
 
@@ -81,6 +96,7 @@ ALTER TABLE respondents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE respondent_anon_map ENABLE ROW LEVEL SECURITY;
 ALTER TABLE protocols ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE turns ENABLE ROW LEVEL SECURITY;
 ALTER TABLE response_tags ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_logs ENABLE ROW LEVEL SECURITY;
@@ -90,6 +106,7 @@ CREATE POLICY service_role_only ON respondents FOR ALL USING (auth.role() = 'ser
 CREATE POLICY service_role_only ON respondent_anon_map FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY service_role_only ON protocols FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY service_role_only ON sessions FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY service_role_only ON questions FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY service_role_only ON turns FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY service_role_only ON response_tags FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY service_role_only ON webhook_logs FOR ALL USING (auth.role() = 'service_role');

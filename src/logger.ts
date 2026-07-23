@@ -8,7 +8,7 @@ export interface LogPayload {
   anonId?: string;
   turnId?: string;
   questionId?: string;
-  provider?: 'gemini' | 'speechmatics' | 'local_classifier' | 'whatsapp';
+  provider?: 'gemini' | 'speechmatics' | 'local_classifier' | 'whatsapp' | 'openai-compatible';
   callReason?: string;
   latencyMs?: number;
   tokenUsage?: {
