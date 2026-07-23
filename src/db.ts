@@ -133,11 +133,11 @@ export function validateDemographicField(field: string, value: string): DemoVali
 
   if (field === 'age') {
     const ageNum = parseInt(trimmed, 10);
-    if (isNaN(ageNum) || !Number.isInteger(ageNum) || ageNum < 10 || ageNum > 99 || String(ageNum) !== trimmed) {
+    if (isNaN(ageNum) || !Number.isInteger(ageNum) || ageNum < 0 || String(ageNum) !== trimmed) {
       return {
         valid: false,
         invalidField: 'age',
-        message: "Please enter a valid age as a whole number between 10 and 99.",
+        message: "Please enter a valid age as a whole number.",
       };
     }
   }
