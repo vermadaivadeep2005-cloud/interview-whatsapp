@@ -1,17 +1,75 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { GoogleGenAI } from '@google/genai';
 import { db, Turn } from './db';
+import { sanitizeTagInput } from './tag-validator';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL_NAME = process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022';
-const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+const LLM_BASE_URL = process.env.LLM_BASE_URL;
+const LLM_API_KEY = process.env.LLM_API_KEY;
+const LLM_MODEL = process.env.LLM_MODEL;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
-const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: any[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+async function fetchWithRetry(url: string, options: RequestInit, retries = 2, delay = 1000): Promise<Response> {
+  let attempt = 0;
+  while (true) {
+    const response = await fetch(url, options);
+    if (response.status === 429 && attempt < retries) {
+      attempt++;
+      console.warn(`[Batch Audit] Rate limited (429) on attempt ${attempt} of ${retries}. Retrying in ${delay}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay *= 2;
+      continue;
+    }
+    return response;
+  }
+}
+
+async function callOpenAICompletion(
+  messages: ChatMessage[],
+  tools?: any[]
+): Promise<any> {
+  if (!LLM_BASE_URL || !LLM_API_KEY || !LLM_MODEL) {
+    throw new Error('LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL must be configured in env variables.');
+  }
+
+  const url = `${LLM_BASE_URL.replace(/\/$/, '')}/chat/completions`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${LLM_API_KEY}`,
+  };
+
+  const body: any = {
+    model: LLM_MODEL,
+    messages,
+  };
+
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+  }
+
+  const response = await fetchWithRetry(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    const err: any = new Error(`LLM API failed with status ${response.status}: ${errorBody}`);
+    err.status = response.status;
+    err.body = errorBody;
+    throw err;
+  }
+
+  return response.json();
+}
 
 // The tool for batch tagging the entire transcript
 export const batchTagTool = {
@@ -60,52 +118,7 @@ export const batchTagTool = {
   },
 };
 
-// Gemini batch tag tool definition
-export const geminiBatchTagTool = {
-  name: 'tag_full_transcript',
-  description: 'Tag all responses from the full interview transcript against the codebook.',
-  parameters: {
-    type: 'OBJECT',
-    properties: {
-      tagged_questions: {
-        type: 'ARRAY',
-        items: {
-          type: 'OBJECT',
-          properties: {
-            question_id: {
-              type: 'STRING',
-              enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all', 'wrap_up'],
-            },
-            raw_response: { type: 'STRING' },
-            economic_outcome: {
-              type: 'STRING',
-              enum: ['income_increase', 'role_change_no_pay_change', 'improved_current_role_only', 'no_change', 'too_early_to_tell'],
-            },
-            bottleneck_types: {
-              type: 'ARRAY',
-              items: {
-                type: 'STRING',
-                enum: ['bottleneck_opportunity', 'bottleneck_employer_buyin', 'bottleneck_confidence', 'bottleneck_tooling_access', 'bottleneck_skill_gap', 'bottleneck_market', 'bottleneck_none_reported'],
-              },
-            },
-            benefit_mechanism: {
-              type: 'STRING',
-              enum: ['efficiency_in_current_role', 'new_income_stream', 'internal_mobility', 'external_mobility', 'credibility_signal', 'not_applicable'],
-            },
-            sentiment: {
-              type: 'STRING',
-              enum: ['positive', 'neutral', 'negative', 'mixed'],
-            },
-            confidence_in_tagging: { type: 'NUMBER' },
-            quotable_snippet: { type: 'STRING' },
-          },
-          required: ['question_id', 'raw_response', 'sentiment', 'confidence_in_tagging'],
-        },
-      },
-    },
-    required: ['tagged_questions'],
-  },
-};
+
 
 export function buildBatchAuditPrompt(codebook: any): string {
   return `
@@ -143,80 +156,77 @@ export async function retagSession(sessionId: string): Promise<void> {
     return;
   }
 
-  if (ai) {
+  if (LLM_API_KEY) {
     const formattedTranscript = formatTranscriptForTagging(transcript);
+    console.log(`[Batch Audit] Calling OpenAI-Compatible API (${LLM_MODEL}) for session ${sessionId}...`);
 
     try {
-      console.log(`[Batch Audit] Calling Gemini API (${GEMINI_MODEL}) for session ${sessionId}...`);
-      const response = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: [{ role: 'user', parts: [{ text: formattedTranscript }] }],
-        config: {
-          systemInstruction: buildBatchAuditPrompt(protocol.codebook),
-          tools: [{ functionDeclarations: [geminiBatchTagTool as any] }],
-        },
-      });
+      const openAIBatchTagTool = [
+        {
+          type: 'function' as const,
+          function: {
+            name: 'tag_full_transcript',
+            description: batchTagTool.description,
+            parameters: batchTagTool.input_schema,
+          }
+        }
+      ];
 
-      if (response.functionCalls && response.functionCalls.length > 0) {
-        const call = response.functionCalls[0];
-        if (call.name === 'tag_full_transcript') {
-          const taggedQuestions = (call.args as any).tagged_questions;
-          console.log(`[Batch Audit via Gemini] Saving ${taggedQuestions.length} audited tags...`);
+      const messages: ChatMessage[] = [
+        { role: 'system', content: buildBatchAuditPrompt(protocol.codebook) },
+        { role: 'user', content: formattedTranscript },
+      ];
+
+      const response = await callOpenAICompletion(messages, openAIBatchTagTool);
+      const choice = response.choices?.[0];
+      const assistantMessage = choice?.message;
+
+      if (assistantMessage?.tool_calls && assistantMessage.tool_calls.length > 0) {
+        const toolCall = assistantMessage.tool_calls[0];
+        if (toolCall.function?.name === 'tag_full_transcript') {
+          const rawArgs = JSON.parse(toolCall.function.arguments);
+          const rawQuestions = rawArgs.tagged_questions || [];
+          const taggedQuestions = rawQuestions.map((q: any) => sanitizeTagInput(q));
+          console.log(`[Batch Audit via OpenAI] Saving ${taggedQuestions.length} audited tags...`);
           await db.saveBatchTags(sessionId, taggedQuestions);
           console.log('[Batch Audit] Successfully saved audited tags.');
         } else {
-          console.warn(`[Batch Audit] Received unexpected function call: ${call.name}`);
+          console.warn(`[Batch Audit] Received unexpected function call: ${toolCall.function?.name}`);
         }
       } else {
-        console.error('[Batch Audit] Gemini did not return a function call.');
+        console.error('[Batch Audit] Model did not return a tool call.');
+        await runSimulatedAudit(sessionId, transcript);
       }
     } catch (err) {
-      console.error('Error during Gemini batch audit:', err);
-    }
-  } else if (anthropic) {
-    const formattedTranscript = formatTranscriptForTagging(transcript);
-
-    const response = await anthropic.messages.create({
-      model: MODEL_NAME,
-      max_tokens: 2000,
-      system: buildBatchAuditPrompt(protocol.codebook),
-      tools: [batchTagTool as any],
-      tool_choice: { type: 'tool', name: 'tag_full_transcript' },
-      messages: [{ role: 'user', content: formattedTranscript }],
-    });
-
-    const toolCall = response.content.find((b) => b.type === 'tool_use' && b.name === 'tag_full_transcript');
-    if (toolCall && toolCall.type === 'tool_use') {
-      const taggedQuestions = (toolCall.input as any).tagged_questions;
-      console.log(`[Batch Audit] Saving ${taggedQuestions.length} audited tags...`);
-      await db.saveBatchTags(sessionId, taggedQuestions);
-      console.log('[Batch Audit] Successfully saved audited tags.');
-    } else {
-      console.error('[Batch Audit] Claude did not return the expected tool call.');
+      console.error('Error during batch audit LLM call:', err);
+      await runSimulatedAudit(sessionId, transcript);
     }
   } else {
-    // Simulated Batch Audit Mode
-    console.log(`[Batch Audit] Neither GEMINI_API_KEY nor ANTHROPIC_API_KEY set. Running in Simulated Audit Mode...`);
-    
-    // Find all respondent turns that have a question_id
-    const respondentTurns = transcript.filter((t) => t.role === 'respondent' && t.question_id);
-    const mockTaggedQuestions = respondentTurns.map((turn) => {
-      return {
-        question_id: turn.question_id!,
-        raw_response: turn.content,
-        economic_outcome: turn.question_id === 'anchor_1' ? 'income_increase' : null,
-        bottleneck_types: turn.question_id === 'anchor_2' ? ['bottleneck_skill_gap'] : null,
-        benefit_mechanism: turn.question_id === 'anchor_3' ? 'efficiency_in_current_role' : null,
-        sentiment: 'positive',
-        confidence_in_tagging: 0.95,
-        quotable_snippet: turn.content.substring(0, Math.min(50, turn.content.length)),
-      };
-    });
-
-    console.log(`[Batch Audit] Saving ${mockTaggedQuestions.length} mock audited tags...`);
-    await db.saveBatchTags(sessionId, mockTaggedQuestions);
-    console.log('[Batch Audit] Successfully saved mock audited tags.');
+    await runSimulatedAudit(sessionId, transcript);
   }
+}
+
+async function runSimulatedAudit(sessionId: string, transcript: Turn[]): Promise<void> {
+  console.log(`[Batch Audit] Running in Simulated Audit Mode...`);
+  
+  // Find all respondent turns that have a question_id
+  const respondentTurns = transcript.filter((t) => t.role === 'respondent' && t.question_id);
+  const mockTaggedQuestions = respondentTurns.map((turn) => {
+    return {
+      question_id: turn.question_id!,
+      raw_response: turn.content,
+      economic_outcome: turn.question_id === 'anchor_1' ? 'income_increase' : null,
+      bottleneck_types: turn.question_id === 'anchor_2' ? ['bottleneck_skill_gap'] : null,
+      benefit_mechanism: turn.question_id === 'anchor_3' ? 'efficiency_in_current_role' : null,
+      sentiment: 'positive',
+      confidence_in_tagging: 0.95,
+      quotable_snippet: turn.content.substring(0, Math.min(50, turn.content.length)),
+    };
+  });
+
+  console.log(`[Batch Audit] Saving ${mockTaggedQuestions.length} mock audited tags...`);
+  await db.saveBatchTags(sessionId, mockTaggedQuestions);
+  console.log('[Batch Audit] Successfully saved mock audited tags.');
 }
 
 // CLI runner

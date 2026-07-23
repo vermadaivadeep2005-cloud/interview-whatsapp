@@ -124,3 +124,55 @@ export function assertValidTag(tag: TagInput, context: string = ''): void {
     throw new Error(`${prefix}Tag validation failed:\n  - ${result.errors.join('\n  - ')}`);
   }
 }
+
+/**
+ * Coerces and sanitizes raw LLM function arguments into types expected by the database schema.
+ */
+export function sanitizeTagInput(input: any): any {
+  const result = { ...input };
+
+  // Parse confidence_in_tagging
+  if (result.confidence_in_tagging !== undefined && result.confidence_in_tagging !== null) {
+    if (typeof result.confidence_in_tagging === 'string') {
+      const parsed = parseFloat(result.confidence_in_tagging);
+      result.confidence_in_tagging = isNaN(parsed) ? 1.0 : parsed;
+    }
+  } else {
+    result.confidence_in_tagging = 1.0;
+  }
+
+  // Parse bottleneck_types
+  if (result.bottleneck_types !== undefined && result.bottleneck_types !== null) {
+    if (typeof result.bottleneck_types === 'string') {
+      try {
+        const normalized = result.bottleneck_types.replace(/'/g, '"');
+        const parsed = JSON.parse(normalized);
+        result.bottleneck_types = Array.isArray(parsed) ? parsed : [result.bottleneck_types];
+      } catch {
+        const trimmed = result.bottleneck_types.trim();
+        if (trimmed && trimmed !== '[]' && trimmed !== 'null' && trimmed !== 'undefined') {
+          result.bottleneck_types = [trimmed];
+        } else {
+          result.bottleneck_types = [];
+        }
+      }
+    } else if (!Array.isArray(result.bottleneck_types)) {
+      result.bottleneck_types = [result.bottleneck_types];
+    }
+  } else {
+    result.bottleneck_types = [];
+  }
+
+  // Map any string values inside bottleneck_types
+  if (Array.isArray(result.bottleneck_types)) {
+    result.bottleneck_types = result.bottleneck_types.filter((item: any) => typeof item === 'string' && item.trim().length > 0);
+  }
+
+  // Parse empty strings to null for optional enum fields
+  if (result.economic_outcome === '') result.economic_outcome = null;
+  if (result.benefit_mechanism === '') result.benefit_mechanism = null;
+  if (result.quotable_snippet === '') result.quotable_snippet = null;
+
+  return result;
+}
+

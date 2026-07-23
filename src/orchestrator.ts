@@ -1,20 +1,80 @@
-import Anthropic from '@anthropic-ai/sdk';
-import { GoogleGenAI } from '@google/genai';
 import { db, Turn, Protocol } from './db';
 import { classifyLocally } from './classifier';
-import { assertValidTag, TagInput } from './tag-validator';
+import { assertValidTag, TagInput, sanitizeTagInput } from './tag-validator';
 import { logger } from './logger';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL_NAME = process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022';
-const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+const LLM_BASE_URL = process.env.LLM_BASE_URL;
+const LLM_API_KEY = process.env.LLM_API_KEY;
+const LLM_MODEL = process.env.LLM_MODEL;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
-const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: any[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+async function fetchWithRetry(url: string, options: RequestInit, retries = 2, delay = 1000): Promise<Response> {
+  let attempt = 0;
+  while (true) {
+    const response = await fetch(url, options);
+    if (response.status === 429 && attempt < retries) {
+      attempt++;
+      logger.warn(`Rate limited (429) on attempt ${attempt} of ${retries}. Retrying in ${delay}ms...`, {
+        url,
+        attempt,
+      });
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay *= 2;
+      continue;
+    }
+    return response;
+  }
+}
+
+async function callOpenAICompletion(
+  messages: ChatMessage[],
+  tools?: any[]
+): Promise<any> {
+  if (!LLM_BASE_URL || !LLM_API_KEY || !LLM_MODEL) {
+    throw new Error('LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL must be configured in env variables.');
+  }
+
+  const url = `${LLM_BASE_URL.replace(/\/$/, '')}/chat/completions`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${LLM_API_KEY}`,
+  };
+
+  const body: any = {
+    model: LLM_MODEL,
+    messages,
+  };
+
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+  }
+
+  const response = await fetchWithRetry(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    const err: any = new Error(`LLM API failed with status ${response.status}: ${errorBody}`);
+    err.status = response.status;
+    err.body = errorBody;
+    throw err;
+  }
+
+  return response.json();
+}
 
 // Gemini call-gating config
 const MIN_CONFIDENCE_FOR_GEMINI = parseFloat(process.env.MIN_CONFIDENCE_FOR_GEMINI || '0.7');
@@ -74,57 +134,7 @@ export const logResponseTool = {
   },
 };
 
-// Gemini Tool definition (requires uppercase types)
-export const geminiLogResponseTool = {
-  name: 'log_response',
-  description: "Log the respondent's answer with structured coding before continuing to the next question.",
-  parameters: {
-    type: 'OBJECT',
-    properties: {
-      question_id: {
-        type: 'STRING',
-        enum: ['anchor_1', 'anchor_1_probe', 'anchor_2', 'anchor_2_probe', 'anchor_3', 'anchor_3_probe', 'anchor_4', 'anchor_4_probe', 'catch_all', 'wrap_up'],
-        description: 'The ID of the question currently being answered.',
-      },
-      raw_response: {
-        type: 'STRING',
-        description: 'The verbatim text response from the respondent.',
-      },
-      economic_outcome: {
-        type: 'STRING',
-        enum: ['income_increase', 'role_change_no_pay_change', 'improved_current_role_only', 'no_change', 'too_early_to_tell'],
-        description: 'The classified economic outcome from training.',
-      },
-      bottleneck_types: {
-        type: 'ARRAY',
-        items: {
-          type: 'STRING',
-          enum: ['bottleneck_opportunity', 'bottleneck_employer_buyin', 'bottleneck_confidence', 'bottleneck_tooling_access', 'bottleneck_skill_gap', 'bottleneck_market', 'bottleneck_none_reported'],
-        },
-        description: 'List of bottlenecks preventing growth, if applicable.',
-      },
-      benefit_mechanism: {
-        type: 'STRING',
-        enum: ['efficiency_in_current_role', 'new_income_stream', 'internal_mobility', 'external_mobility', 'credibility_signal', 'not_applicable'],
-        description: 'How training translated into benefits, if applicable.',
-      },
-      sentiment: {
-        type: 'STRING',
-        enum: ['positive', 'neutral', 'negative', 'mixed'],
-        description: 'Overall sentiment of the response.',
-      },
-      confidence_in_tagging: {
-        type: 'NUMBER',
-        description: 'Confidence score (0.0 to 1.0) of the tagging classification.',
-      },
-      quotable_snippet: {
-        type: 'STRING',
-        description: 'A key direct quote from the response.',
-      },
-    },
-    required: ['question_id', 'raw_response', 'sentiment', 'confidence_in_tagging'],
-  },
-};
+
 
 export function buildSystemPrompt(protocol: Protocol): string {
   return `
@@ -284,16 +294,16 @@ export async function handleTurn(
   const localClassification = classifyLocally(respondentInput, currentQuestionId);
   logger.info('Local classification completed', { sessionId, questionId: currentQuestionId, provider: 'local_classifier', callReason: localClassification.call_reason, confidence: localClassification.confidence });
 
-  // Count how many Gemini calls have been made this session (via saved tags)
+  // Count how many LLM calls have been made this session (via saved tags)
   const allTags = await db.getTagsForSession(sessionId);
-  const geminiCallCount = allTags.filter((t: any) => t.metadata?.gemini_call === true).length;
-  const geminiCapReached = geminiCallCount >= MAX_GEMINI_CALLS_PER_SESSION;
+  const llmCallCount = allTags.filter((t: any) => t.metadata?.llm_call === true).length;
+  const llmCapReached = llmCallCount >= MAX_GEMINI_CALLS_PER_SESSION;
 
-  const shouldCallGemini = Boolean(ai) &&
+  const shouldCallLLM = Boolean(LLM_API_KEY) &&
     localClassification.confidence < MIN_CONFIDENCE_FOR_GEMINI &&
-    !geminiCapReached;
+    !llmCapReached;
 
-  if (!shouldCallGemini && localClassification.confidence >= MIN_CONFIDENCE_FOR_GEMINI) {
+  if (!shouldCallLLM && localClassification.confidence >= MIN_CONFIDENCE_FOR_GEMINI) {
     const localTag: TagInput = {
       question_id: currentQuestionId,
       raw_response: respondentInput,
@@ -308,44 +318,49 @@ export async function handleTurn(
     };
     try {
       assertValidTag(localTag, 'LocalClassifier');
-      await db.saveTag(sessionId, { ...localTag, metadata: { gemini_call: false, call_reason: localClassification.call_reason } });
-      logger.info('Gemini skipped: local classification confident', { sessionId, questionId: currentQuestionId, provider: 'local_classifier', confidence: localClassification.confidence });
+      await db.saveTag(sessionId, { ...localTag, metadata: { llm_call: false, call_reason: localClassification.call_reason } });
+      logger.info('LLM skipped: local classification confident', { sessionId, questionId: currentQuestionId, provider: 'local_classifier', confidence: localClassification.confidence });
     } catch (e) {
       console.warn('[Orchestrator] Local tag validation failed:', (e as Error).message);
     }
   }
 
-  // 4. Check if we should use the Live Gemini API, Claude API, or run in Simulated Mode
-  const gemini = ai;
-  if (shouldCallGemini && gemini) {
-    logger.info('Calling Gemini API', { sessionId, questionId: currentQuestionId, provider: 'gemini', callReason: 'low_confidence_fallback', callIndex: geminiCallCount + 1 });
-    // Format history for Gemini contents array
-    const contents = history.map((turn) => ({
-      role: (turn.role as string) === 'respondent' ? 'user' : 'model',
-      parts: [{ text: turn.content }],
-    }));
-    // Add current input
-    contents.push({
-      role: 'user',
-      parts: [{ text: respondentInput }],
-    });
+  if (shouldCallLLM) {
+    logger.info('Calling LLM API', { sessionId, questionId: currentQuestionId, provider: 'openai-compatible', callReason: 'low_confidence_fallback', callIndex: llmCallCount + 1 });
+    
+    // Format messages for OpenAI Chat Completion
+    const messages: ChatMessage[] = [
+      { role: 'system', content: buildSystemPrompt(protocol) },
+      ...history.map((turn) => ({
+        role: (turn.role === 'respondent' ? 'user' : 'assistant') as 'user' | 'assistant',
+        content: turn.content,
+      })),
+      { role: 'user', content: respondentInput }
+    ];
 
     try {
-      let response = await gemini.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: contents as any,
-        config: {
-          systemInstruction: buildSystemPrompt(protocol),
-          tools: [{ functionDeclarations: [geminiLogResponseTool as any] }],
-        },
-      });
+      const openAIToolList = [
+        {
+          type: 'function' as const,
+          function: {
+            name: 'log_response',
+            description: logResponseTool.description,
+            parameters: logResponseTool.input_schema
+          }
+        }
+      ];
 
-      // Handle tool call
-      if (response.functionCalls && response.functionCalls.length > 0) {
-        const call = response.functionCalls[0];
-        if (call.name === 'log_response') {
-          const input = call.args as any;
-          logger.info('Gemini model triggered log_response tool call', { sessionId, questionId: currentQuestionId, provider: 'gemini', callReason: 'tool_execution' });
+      let completionResult = await callOpenAICompletion(messages, openAIToolList);
+      const choice = completionResult.choices?.[0];
+      const assistantMessage = choice?.message;
+      let toolCallExecuted = false;
+
+      if (assistantMessage?.tool_calls && assistantMessage.tool_calls.length > 0) {
+        const toolCall = assistantMessage.tool_calls[0];
+        if (toolCall.function?.name === 'log_response') {
+          const parsedArgs = JSON.parse(toolCall.function.arguments);
+          const input = sanitizeTagInput(parsedArgs);
+          logger.info('LLM model triggered log_response tool call', { sessionId, questionId: currentQuestionId, provider: 'openai-compatible', callReason: 'tool_execution' });
           const tagToSave: TagInput = {
             question_id: input.question_id,
             raw_response: input.raw_response,
@@ -357,75 +372,55 @@ export async function handleTurn(
             transcription_confidence: meta.transcriptionConfidence,
             quotable_snippet: input.quotable_snippet || null,
             turn_id: respondentTurn.id,
-            metadata: { gemini_call: true, model: GEMINI_MODEL }
+            metadata: { llm_call: true, model: LLM_MODEL }
           };
-          assertValidTag(tagToSave, 'GeminiAPI');
+          assertValidTag(tagToSave, 'OpenAIAPI');
           await db.saveTag(sessionId, tagToSave);
 
-          // Resume contents to get the actual text reply from Gemini
-          contents.push(response.candidates?.[0]?.content as any); // model's functionCall turn
-          contents.push({
-            role: 'user',
-            parts: [{
-              text: JSON.stringify({ functionResponse: { name: 'log_response', response: { status: 'logged' } } })
-            }]
+          // Resume contents to get the actual text reply from OpenAI-compatible endpoint
+          messages.push(assistantMessage);
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name: 'log_response',
+            content: JSON.stringify({ status: 'logged' })
           });
 
-          const resumeResponse = await gemini.models.generateContent({
-            model: GEMINI_MODEL,
-            contents: contents as any,
-            config: {
-              systemInstruction: buildSystemPrompt(protocol),
-              tools: [{ functionDeclarations: [geminiLogResponseTool as any] }],
-            },
-          });
-          response = resumeResponse;
+          const resumeResult = await callOpenAICompletion(messages, openAIToolList);
+          const resumeChoice = resumeResult.choices?.[0];
+          replyText = resumeChoice?.message?.content || '';
+          toolCallExecuted = true;
         }
       }
 
-      replyText = response.text || '';
-    } catch (err) {
-      console.error('Error calling Gemini API:', err);
-      replyText = "Sorry, I encountered an error processing your request. Please try again.";
-    }
-  } else if (anthropic) {
-    console.log(`[Orchestrator] Calling Claude API for session ${sessionId}...`);
-    // Format history for Claude messages array
-    const messages = [...history, { role: 'user' as const, content: respondentInput }];
-
-    const response = await anthropic.messages.create({
-      model: MODEL_NAME,
-      max_tokens: 500,
-      system: buildSystemPrompt(protocol),
-      tools: [logResponseTool as any],
-      messages: messages,
-    });
-
-    // Handle tool use blocks in the output
-    for (const block of response.content) {
-      if (block.type === 'tool_use' && block.name === 'log_response') {
-        const input = block.input as any;
-        console.log(`[Orchestrator] Save Tag:`, input);
-        await db.saveTag(sessionId, {
-          question_id: input.question_id,
-          raw_response: input.raw_response,
-          economic_outcome: input.economic_outcome || null,
-          bottleneck_types: input.bottleneck_types || null,
-          benefit_mechanism: input.benefit_mechanism || null,
-          sentiment: input.sentiment,
-          confidence_in_tagging: input.confidence_in_tagging,
-          transcription_confidence: meta.transcriptionConfidence,
-          quotable_snippet: input.quotable_snippet || null,
-          turn_id: respondentTurn.id,
-        });
+      if (!toolCallExecuted) {
+        replyText = assistantMessage?.content || '';
       }
-    }
+    } catch (err: any) {
+      console.error('--- DETAILED LLM ERROR LOG ---');
+      console.error('Provider: OpenAI-Compatible API');
+      console.error('Base URL:', LLM_BASE_URL);
+      console.error('Model:', LLM_MODEL);
+      console.error('HTTP Status Code:', err?.status || err?.statusCode || 'Unknown');
+      console.error('Error Message:', err?.message || err);
+      console.error('Error Details:', err?.body || JSON.stringify(err));
+      console.error('------------------------------');
 
-    // Find assistant text reply
-    replyText = response.content.find((b) => b.type === 'text')?.text ?? "Thanks — that's everything I needed.";
+      // Robust fallback to deterministic fixed flow
+      logger.warn('[Orchestrator] LLM failed, falling back to Simulated Mode', { sessionId, questionId: currentQuestionId });
+      const simResult = await runSimulatedOrchestrator(
+        sessionId,
+        respondentInput,
+        currentQuestionId,
+        respondentTurn.id,
+        protocol,
+        meta.transcriptionConfidence
+      );
+      replyText = simResult.reply;
+    }
   } else {
     // RUN SIMULATED DIALOGUE MODE
-    console.log(`[Orchestrator] Neither GEMINI_API_KEY nor ANTHROPIC_API_KEY set. Running in Simulated Mode...`);
+    logger.info('Running in Simulated Mode (LLM key omitted or cap reached)', { sessionId, questionId: currentQuestionId });
     const simResult = await runSimulatedOrchestrator(
       sessionId,
       respondentInput,
