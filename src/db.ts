@@ -81,7 +81,6 @@ export interface ResponseTag {
   session_id: string;
   turn_id: string | null;
   question_id: string;
-  question_uuid?: string | null;
   source: 'live' | 'batch_audit';
   raw_response: string;
   economic_outcome?: string | null;
@@ -409,6 +408,16 @@ export const db = {
       .eq('session_id', sessionId)
       .order('turn_number', { ascending: true, nullsFirst: false });
 
+    if (error) throw error;
+    return data || [];
+  },
+
+  async getSessionQuestions(sessionId: string): Promise<{ id: string, anchor_key: string | null }[]> {
+    const { data, error } = await supabase
+      .from('questions')
+      .select('id, anchor_key')
+      .eq('session_id', sessionId);
+      
     if (error) throw error;
     return data || [];
   },

@@ -222,8 +222,7 @@ export async function handleTurn(
 
   // 1. Determine which question the respondent is answering
   let currentQuestionId: string = 'consent';
-  // Track the question_uuid of the question that prompted this response
-  let pendingQuestionUuid: string | null = null;
+  let pendingQuestionId: string | null = null;
 
   if (history.length > 0) {
     // Find the last assistant message and its question_id if stored
@@ -245,7 +244,7 @@ export async function handleTurn(
       .limit(1)
       .maybeSingle();
     if (lastQuestion) {
-      pendingQuestionUuid = lastQuestion.id;
+      pendingQuestionId = lastQuestion.id;
     }
   } catch {
     // Non-critical: if questions table doesn't exist yet, continue without it
@@ -425,12 +424,11 @@ export async function handleTurn(
       transcription_confidence: meta.transcriptionConfidence,
       quotable_snippet: respondentInput.slice(0, 80),
       turn_id: respondentTurn.id,
-      question_uuid: pendingQuestionUuid,
       turn_number: respondentTurn.turn_number,
     };
     try {
       assertValidTag(localTag, 'LocalClassifier');
-      await db.saveTag(sessionId, { ...localTag, metadata: { llm_call: false, call_reason: localClassification.call_reason } });
+      await db.saveTag(sessionId, { ...localTag, question_id: pendingQuestionId as string, metadata: { llm_call: false, call_reason: localClassification.call_reason } });
       logger.info('LLM skipped: local classification confident', { sessionId, questionId: currentQuestionId, provider: 'local_classifier', confidence: localClassification.confidence });
     } catch (e) {
       logger.error('[Orchestrator] Local tag validation/save failed', e, {
@@ -488,12 +486,11 @@ export async function handleTurn(
             transcription_confidence: meta.transcriptionConfidence,
             quotable_snippet: input.quotable_snippet || null,
             turn_id: respondentTurn.id,
-            question_uuid: pendingQuestionUuid,
             turn_number: respondentTurn.turn_number,
             metadata: { llm_call: true, model: LLM_MODEL }
           };
           assertValidTag(tagToSave, 'OpenAIAPI');
-          await db.saveTag(sessionId, tagToSave);
+          await db.saveTag(sessionId, { ...tagToSave, question_id: pendingQuestionId as string });
 
           // Resume contents to get the actual text reply from OpenAI-compatible endpoint
           messages.push(assistantMessage);
@@ -529,12 +526,11 @@ export async function handleTurn(
           transcription_confidence: meta.transcriptionConfidence,
           quotable_snippet: respondentInput.slice(0, 80),
           turn_id: respondentTurn.id,
-          question_uuid: pendingQuestionUuid,
           turn_number: respondentTurn.turn_number,
           metadata: { llm_call: true, model: LLM_MODEL, fallback: true },
         };
         try {
-          await db.saveTag(sessionId, fallbackTag);
+          await db.saveTag(sessionId, { ...fallbackTag, question_id: pendingQuestionId as string });
         } catch (e) {
           logger.error('[Orchestrator] Failed to save fallback tag on LLM no-tool-call path', e, {
             sessionId,
@@ -563,7 +559,7 @@ export async function handleTurn(
         respondentTurn.turn_number,
         protocol,
         meta.transcriptionConfidence,
-        pendingQuestionUuid
+        pendingQuestionId
       );
       replyText = simResult.reply;
     }
@@ -578,7 +574,7 @@ export async function handleTurn(
       respondentTurn.turn_number,
       protocol,
       meta.transcriptionConfidence,
-      pendingQuestionUuid
+      pendingQuestionId
     );
     replyText = simResult.reply;
   }
@@ -638,7 +634,7 @@ async function runSimulatedOrchestrator(
   turnNumber: number,
   protocol: Protocol,
   transcriptionConfidence: number | null,
-  pendingQuestionUuid: string | null
+  pendingQuestionId: string | null
 ): Promise<{ reply: string }> {
   const aq = protocol.anchor_questions;
   const words = input.trim().split(/\s+/).filter(Boolean);
@@ -854,9 +850,9 @@ async function runSimulatedOrchestrator(
     try {
       await db.saveTag(sessionId, {
         ...mockTag,
+        question_id: pendingQuestionId as string,
         transcription_confidence: transcriptionConfidence,
         turn_id: turnId,
-        question_uuid: pendingQuestionUuid,
         turn_number: turnNumber,
       });
     } catch (e) {

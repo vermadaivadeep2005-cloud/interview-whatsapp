@@ -186,7 +186,20 @@ export async function retagSession(sessionId: string): Promise<void> {
         if (toolCall.function?.name === 'tag_full_transcript') {
           const rawArgs = JSON.parse(toolCall.function.arguments);
           const rawQuestions = rawArgs.tagged_questions || [];
-          const taggedQuestions = rawQuestions.map((q: any) => sanitizeTagInput(q));
+          
+          const sessionQuestions = await db.getSessionQuestions(sessionId);
+          const questionMap = new Map<string, string>();
+          sessionQuestions.forEach(q => {
+            if (q.anchor_key) questionMap.set(q.anchor_key, q.id);
+          });
+          
+          const taggedQuestions = rawQuestions.map((q: any) => {
+            const sanitized = sanitizeTagInput(q);
+            return {
+              ...sanitized,
+              question_id: questionMap.get(sanitized.question_id) || sanitized.question_id
+            };
+          });
           console.log(`[Batch Audit via OpenAI] Saving ${taggedQuestions.length} audited tags...`);
           await db.saveBatchTags(sessionId, taggedQuestions);
           console.log('[Batch Audit] Successfully saved audited tags.');
@@ -211,9 +224,15 @@ async function runSimulatedAudit(sessionId: string, transcript: Turn[]): Promise
   
   // Find all respondent turns that have a question_id
   const respondentTurns = transcript.filter((t) => t.role === 'respondent' && t.question_id);
+  const sessionQuestions = await db.getSessionQuestions(sessionId);
+  const questionMap = new Map<string, string>();
+  sessionQuestions.forEach(q => {
+    if (q.anchor_key) questionMap.set(q.anchor_key, q.id);
+  });
+
   const mockTaggedQuestions = respondentTurns.map((turn) => {
     return {
-      question_id: turn.question_id!,
+      question_id: questionMap.get(turn.question_id!) || turn.question_id!,
       raw_response: turn.content,
       economic_outcome: turn.question_id === 'anchor_1' ? 'income_increase' : null,
       bottleneck_types: turn.question_id === 'anchor_2' ? ['bottleneck_skill_gap'] : null,
