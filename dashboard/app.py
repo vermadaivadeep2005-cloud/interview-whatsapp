@@ -4,6 +4,7 @@ from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
 import plotly.express as px
+import requests
 
 # Load environment variables from the parent directory .env file
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -48,7 +49,7 @@ def fetch_tags():
 
 # Sidebar navigation
 st.sidebar.title("Interview WhatsApp")
-page = st.sidebar.radio("Navigation", ["Overview", "Sessions & Transcripts", "Response Analysis"])
+page = st.sidebar.radio("Navigation", ["Overview", "Sessions & Transcripts", "Response Analysis", "Web Interview"])
 
 if page == "Overview":
     st.title("Overview")
@@ -180,3 +181,98 @@ elif page == "Response Analysis":
                 sent_counts.columns = ['Sentiment', 'Count']
                 fig2 = px.pie(sent_counts, values='Count', names='Sentiment', title="Sentiment Analysis")
                 st.plotly_chart(fig2, width='stretch')
+
+elif page == "Web Interview":
+    st.title("Web Interview Client")
+    
+    if "phone" not in st.session_state:
+        st.session_state.phone = ""
+    
+    if not st.session_state.phone:
+        st.markdown("### Welcome! Please enter your phone number or unique ID to start.")
+        phone_input = st.text_input("Phone Number / ID")
+        if st.button("Start Interview"):
+            if phone_input:
+                st.session_state.phone = phone_input
+                st.rerun()
+            else:
+                st.error("Please enter a valid ID.")
+    else:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(f"**Logged in as:** `{st.session_state.phone}`")
+        if st.sidebar.button("Log Out"):
+            st.session_state.phone = ""
+            st.rerun()
+        
+        # We need to fetch the session ID for this phone to display history
+        # Since we don't have a direct query for it in the dashboard, we can just fetch all and match
+        sessions_df = fetch_sessions()
+        respondents_df = fetch_respondents()
+        
+        session_id = None
+        if not respondents_df.empty and not sessions_df.empty:
+            respondent = respondents_df[respondents_df['phone'] == st.session_state.phone]
+            if not respondent.empty:
+                r_id = respondent.iloc[0]['id']
+                user_sessions = sessions_df[sessions_df['respondent_id'] == r_id]
+                if not user_sessions.empty:
+                    session_id = user_sessions.iloc[0]['id']
+        
+        st.markdown("### Chat History")
+        
+        if session_id:
+            turns_df = fetch_turns(session_id)
+            if not turns_df.empty:
+                import html
+                chat_html = '<div style="background-color: #0b141a; padding: 20px; border-radius: 10px; display: flex; flex-direction: column; gap: 10px; height: 400px; overflow-y: auto; border: 1px solid #333;">'
+                for _, row in turns_df.iterrows():
+                    role = row['role']
+                    content = html.escape(str(row['content'])).replace('\n', '<br>')
+                    
+                    if role == 'assistant':
+                        chat_html += f'<div style="max-width: 75%; padding: 8px 12px; border-radius: 7.5px; font-family: sans-serif; font-size: 14px; background-color: #005c4b; align-self: flex-start; color: white;">{content}</div>'
+                    else:
+                        chat_html += f'<div style="max-width: 75%; padding: 8px 12px; border-radius: 7.5px; font-family: sans-serif; font-size: 14px; background-color: #202c33; align-self: flex-end; color: white;">{content}</div>'
+                chat_html += '</div>'
+                st.markdown(chat_html, unsafe_allow_html=True)
+            else:
+                st.info("No messages yet.")
+        else:
+            st.info("Say hello to start the interview!")
+            
+        st.markdown("---")
+        
+        # Input methods
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("**Send a Text Message**")
+            with st.form("chat_form", clear_on_submit=True):
+                user_input = st.text_input("Type your message here...")
+                submitted = st.form_submit_button("Send")
+                if submitted and user_input:
+                    with st.spinner("Sending..."):
+                        try:
+                            resp = requests.post("http://localhost:3000/api/web-chat", json={"phone": st.session_state.phone, "text": user_input})
+                            if resp.status_code == 200:
+                                st.rerun()
+                            else:
+                                st.error("Failed to send message.")
+                        except Exception as e:
+                            st.error(f"Error connecting to backend: {e}")
+
+        with col2:
+            st.markdown("**Or Send a Voice Message**")
+            audio_value = st.audio_input("Record a voice note")
+            if audio_value:
+                with st.spinner("Uploading and processing audio..."):
+                    try:
+                        files = {'audio': ('recording.wav', audio_value.getvalue(), 'audio/wav')}
+                        data = {'phone': st.session_state.phone}
+                        resp = requests.post("http://localhost:3000/api/web-chat", data=data, files=files)
+                        if resp.status_code == 200:
+                            st.rerun()
+                        else:
+                            st.error("Failed to send audio.")
+                    except Exception as e:
+                        st.error(f"Error connecting to backend: {e}")

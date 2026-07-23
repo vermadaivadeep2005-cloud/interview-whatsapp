@@ -7,6 +7,7 @@ import { downloadWhatsAppMedia } from './whatsapp';
 import { getTransport } from './transport';
 import { logger } from './logger';
 import { transcribeAudio } from './transcribe';
+import multer from 'multer';
 
 dotenv.config();
 
@@ -186,6 +187,84 @@ app.post('/webhook', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Unhandled webhook route crash', error, { provider: 'whatsapp', success: false });
     return res.status(200).send('OK');
+  }
+});
+
+// Web Chat API Endpoint
+const upload = multer();
+
+app.post('/api/web-chat', upload.single('audio'), async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { phone, text: bodyText } = req.body;
+    if (!phone) return res.status(400).json({ error: 'phone is required' });
+
+    const channel = 'web';
+    const session = await db.getOrCreateSessionForPhone(phone, channel);
+    const sessionId = session.id;
+
+    await db.updateSessionActivity(sessionId);
+
+    let text = bodyText || '';
+    let inputMode: 'text' | 'voice' = 'text';
+    let transcriptionConfidence: number | null = null;
+
+    if (req.file) {
+      logger.info('Incoming web audio received', { provider: 'web', callReason: 'audio_received' });
+      inputMode = 'voice';
+      try {
+        const transcription = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
+        text = transcription.text;
+        transcriptionConfidence = transcription.confidence;
+        logger.info('Audio transcription completed', { provider: 'speechmatics', callReason: 'transcription_success' });
+      } catch (err) {
+        logger.error('Failed to process incoming web audio', err, { provider: 'web', success: false });
+        return res.status(500).json({ error: 'Failed to transcribe audio', reply: 'Sorry, I had trouble processing that voice note.' });
+      }
+    }
+
+    const currentMode = session.mode_of_input;
+    let nextMode = currentMode;
+    if (!currentMode) nextMode = inputMode;
+    else if (currentMode === 'text' && inputMode === 'voice') nextMode = 'mixed';
+    else if (currentMode === 'voice' && inputMode === 'text') nextMode = 'mixed';
+    if (nextMode !== currentMode && nextMode) await db.updateSessionModeOfInput(sessionId, nextMode);
+
+    if (!session.consent_given) {
+      const normalizedInput = text.trim().toLowerCase();
+      const isConsentYes = normalizedInput === 'consent_yes' || normalizedInput === 'yes' || normalizedInput === 'y' || normalizedInput === 'ok' || normalizedInput === 'okay';
+      const isConsentNo = normalizedInput === 'consent_no' || normalizedInput === 'no' || normalizedInput === 'n';
+
+      if (isConsentYes) {
+        await db.updateSessionStatus(sessionId, 'in_progress', true);
+        const firstDemoReply = 'Karibu! Before we begin the interview, could you share your name?';
+        await db.appendTurn(sessionId, 'assistant', firstDemoReply, 'text', 'demo_name');
+        return res.json({ reply: firstDemoReply });
+      } else if (isConsentNo) {
+        await db.updateSessionStatus(sessionId, 'declined', false);
+        return res.json({ reply: "Thank you for your time. The interview has been declined." });
+      } else {
+        return res.json({ reply: "Would you like to participate in this interview? Please reply with 'Yes' or 'No'." });
+      }
+    }
+
+    if (text.trim().toLowerCase() === 'stop') {
+      await db.updateSessionStatus(sessionId, 'abandoned');
+      return res.json({ reply: "You have stopped the interview. Your answers up to this point have been saved. Thank you." });
+    }
+
+    let reply: string;
+    try {
+      reply = await handleTurn(sessionId, text, { inputMode, transcriptionConfidence });
+    } catch (orchErr) {
+      logger.error('handleTurn threw error', orchErr, { sessionId });
+      await db.updateSessionStatus(sessionId, 'abandoned');
+      return res.json({ reply: "Sorry, something went wrong on our end. Your answers have been saved." });
+    }
+
+    return res.json({ reply });
+  } catch (error) {
+    logger.error('Unhandled web-chat crash', error, { provider: 'web' });
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
